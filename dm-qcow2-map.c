@@ -7,13 +7,38 @@
 #include <linux/fs.h>
 #include <uapi/linux/falloc.h>
 #include <linux/blk-mq.h>
+#include <linux/kthread.h>
 #include <linux/zlib.h>
 #include <linux/error-injection.h>
 #include <linux/zstd.h>
 
-#include "dm.h"
-#include "dm-rq.h"
 #include "dm-qcow2.h"
+
+/*
+ * Prefix of private struct dm_rq_target_io from drivers/md/dm-rq.c.
+ *
+ * Mainline does not export dm_complete_request(), so an out-of-tree
+ * request-based target has no supported way to complete a request that
+ * returned DM_MAPIO_SUBMITTED.
+ * If this part is out of sync, everything will explode.
+ */
+#error THIS IS A HACK I AM AWARE OF
+struct dm_rq_target_io_compat {
+	struct mapped_device *md;
+	struct dm_target *ti;
+	struct request *orig;
+	struct request *clone;
+	struct kthread_work work;
+	blk_status_t error;
+};
+
+static void qcow2_complete_request(struct request *rq, blk_status_t error)
+{
+	struct dm_rq_target_io_compat *tio = blk_mq_rq_to_pdu(rq);
+
+	tio->error = error;
+	blk_mq_complete_request(rq);
+}
 
 /* "Exactly one bit" has the same number in L1 and L2 */
 #define LX_REFCOUNT_EXACTLY_ONE (1ULL << 63)
@@ -2210,7 +2235,7 @@ unlock:
 
 int qcow2_truncate_safe(struct file *file, loff_t new_len)
 {
-	return do_ftruncate(file, new_len, 0);
+	return vfs_truncate(&file->f_path, new_len);
 }
 
 static int truncate_prealloc_safe(struct qcow2 *qcow2, loff_t len, const char *func)
@@ -4446,7 +4471,7 @@ static void qrq_endio(struct qcow2_target *tgt, struct qio *qio,
 	}
 
 	mempool_free(qrq, tgt->qrq_pool);
-	dm_complete_request(rq, bi_status);
+	qcow2_complete_request(rq, bi_status);
 }
 
 static void init_qrq(struct qcow2_rq *qrq, struct request *rq)
@@ -4728,285 +4753,4 @@ int qcow2_fast_init(void)
 	}
 
 	return 0;
-}
-
-struct qio_data_llseek_hole {
-	struct completion compl;
-	struct qio *higher;
-	loff_t lim;
-};
-
-#define SEEK_QIO_DATA(qio) ((struct qio_data_llseek_hole *)qio->data)
-
-static void seek_qio_set_sector(struct qio *qio, sector_t bi_sector)
-{
-	loff_t pos = to_bytes(bi_sector);
-	loff_t end = round_up(pos + 1, qio->qcow2->clu_size);
-
-	qio->bi_iter.bi_sector = bi_sector;
-	end = min_t(loff_t, end, SEEK_QIO_DATA(qio)->lim);
-	qio->bi_iter.bi_size = end > pos ? end - pos : 0;
-}
-
-static struct qio *alloc_seek_qio(struct qcow2 *qcow2, struct qio *parent, loff_t new_lim)
-{
-	struct qio_data_llseek_hole *data;
-	struct qio *qio;
-
-	qio = qcow2_alloc_qio(qcow2->tgt->qio_pool, true);
-	if (!qio)
-		return NULL;
-
-	qcow2_init_qio(qio, REQ_OP_READ, qcow2);
-	qio->queue_list_id = QLIST_SEEK;
-
-	data = kzalloc(sizeof(struct qio_data_llseek_hole), GFP_KERNEL);
-	if (!data) {
-		qcow2_free_qio(qio, qcow2->tgt->qio_pool);
-		return NULL;
-	}
-
-	qio->data = data;
-	init_completion(&data->compl);
-	data->lim = new_lim;
-
-	if (parent) {
-		data->higher = parent;
-		seek_qio_set_sector(qio, parent->bi_iter.bi_sector);
-	}
-
-	return qio;
-}
-
-static struct qio *free_seek_qio_ret_higher(struct qio *qio)
-{
-	struct qio *ret = SEEK_QIO_DATA(qio)->higher;
-
-	kfree(qio->data);
-	qcow2_free_qio(qio, qio->qcow2->tgt->qio_pool);
-
-	return ret;
-}
-
-static inline sector_t get_next_l2(struct qio *qio)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	u64 l2_cover = to_sector((u64)qcow2->clu_size * qcow2->l2_entries);
-
-	return round_up(qio->bi_iter.bi_sector + 1, l2_cover);
-}
-
-static inline sector_t get_next_clu(struct qio *qio)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	loff_t offset;
-
-	offset = to_bytes(qio->bi_iter.bi_sector);
-	offset = (offset + qcow2->clu_size) / qcow2->clu_size;
-	offset *= qcow2->clu_size;
-
-	return to_sector(offset);
-}
-
-static inline void seek_qio_next_clu(struct qio *qio, struct qcow2_map *map)
-{
-	sector_t bi_sector;
-
-	/*
-	 * Whole L2 table is unmapped - skip to next l2 table,
-	 * but only if there is no backing data
-	 */
-	if (map && !(map->level & L2_LEVEL) &&
-	    !maybe_mapped_in_lower_delta(qio->qcow2, qio))
-		bi_sector = get_next_l2(qio);
-	else
-		bi_sector = get_next_clu(qio);
-
-	seek_qio_set_sector(qio, bi_sector);
-}
-
-/*
- * Manually scan L2 metadata pages until we hit something interesting.
- * We do not take md_pages_lock here because we have no promises about
- * concurrent writes anyway.
- */
-static loff_t seek_extend_unmapped_end(struct qio *qio, struct qcow2_map *map,
-				       loff_t end)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	loff_t lim = SEEK_QIO_DATA(qio)->lim;
-	u32 step = 1 + qcow2->ext_l2;
-	u32 index = map->l2.index_in_page + step;
-	u64 *entries;
-
-	entries = kmap_local_page(map->l2.md->page);
-	for (; index + step <= PAGE_SIZE / sizeof(u64) && end < lim;
-	     index += step) {
-		/* Zero test does not need be64_to_cpu() */
-		if (READ_ONCE(entries[index]) ||
-		    (qcow2->ext_l2 && READ_ONCE(entries[index + 1])))
-			break;
-		end += qcow2->clu_size;
-	}
-	kunmap_local(entries);
-
-	return min_t(loff_t, end, lim);
-}
-
-static struct qio *advance_and_spawn_lower_seek_qio(struct qio *old_qio, loff_t end)
-{
-	struct qcow2 *lower = old_qio->qcow2->lower;
-	struct qio *new_qio;
-
-	if (end > lower->hdr.size)
-		end = lower->hdr.size;
-
-	new_qio = alloc_seek_qio(lower, old_qio, end);
-	if (!new_qio)
-		return NULL;
-
-	seek_qio_set_sector(old_qio, to_sector(end));
-
-	return new_qio;
-}
-
-static int qcow2_llseek_hole_qio(struct qio *qio, int whence, loff_t *result)
-{
-	struct calc_front_bytes_ret arg;
-	struct qcow2_map map;
-	struct qio *qptr;
-	int ret;
-	u32 size;
-
-	while (1) {
-		if (to_bytes(qio->bi_iter.bi_sector) >= SEEK_QIO_DATA(qio)->lim) {
-			if (SEEK_QIO_DATA(qio)->higher) {
-				qio = free_seek_qio_ret_higher(qio);
-				continue;
-			}
-			ret = 0;
-			*result = to_bytes(qio->bi_iter.bi_sector);
-			break;
-		}
-
-		memset(&map, 0, sizeof(map));
-		map.qcow2 = qio->qcow2;
-		qptr = qio;
-
-		ret = parse_metadata(qio->qcow2, &qptr, &map);
-		if (ret < 0)
-			break;
-		if (qptr == NULL) {
-			/* one of metadata pages is not loaded and qio is postponed*/
-			wait_for_completion(&SEEK_QIO_DATA(qio)->compl);
-			reinit_completion(&SEEK_QIO_DATA(qio)->compl);
-			continue;
-		}
-
-calc_subclu:
-		size = calc_front_qio_bytes(qio->qcow2, qio, &map, &arg);
-
-		if (arg.unmapped && arg.try_lower) {
-			/*
-			 * Check if the backing image is big enough, then advance current qio
-			 * and spawn a new one for lower image
-			 */
-			if (to_bytes(qio->bi_iter.bi_sector) < qio->qcow2->lower->hdr.size) {
-				struct qio *new_qio;
-				loff_t end;
-
-				if (!(map.level & L2_LEVEL)) {
-					end = min_t(loff_t,
-						    to_bytes(get_next_l2(qio)),
-						    SEEK_QIO_DATA(qio)->lim);
-				} else {
-					end = to_bytes(qio->bi_iter.bi_sector) + size;
-					/* extend operates on cluster granularity */
-					if (!CLU_OFF(qio->qcow2, end))
-						end = seek_extend_unmapped_end(qio, &map, end);
-				}
-
-				new_qio = advance_and_spawn_lower_seek_qio(qio, end);
-				if (!new_qio) {
-					ret = -ENOMEM;
-					break;
-				}
-
-				qio = new_qio;
-				continue;
-			}
-		}
-
-		if (whence == SEEK_HOLE) {
-			if (arg.zeroes || arg.unmapped) {
-				*result = to_bytes(qio->bi_iter.bi_sector);
-				ret = 0;
-				break;
-			} else if (size != qio->bi_iter.bi_size) {
-				/*
-				 * range starts with data subclusters and after that
-				 * some subclusters are zero or unmapped
-				 */
-				*result = to_bytes(qio->bi_iter.bi_sector) + size;
-				ret = 0;
-				break;
-			}
-		}
-
-		if (whence == SEEK_DATA) {
-			if (!arg.zeroes && !arg.unmapped) {
-				*result = to_bytes(qio->bi_iter.bi_sector);
-				ret = 0;
-				break;
-			} else if (size != qio->bi_iter.bi_size) {
-				/*
-				 * range starts with zero or unmapped subclusters
-				 * but after that it still can be unmapped or zero
-				 * We do not need to parse metadata again but we should
-				 * skip this sublusters and look onto next ones
-				 */
-				qio->bi_iter.bi_sector += to_sector(size);
-				qio->bi_iter.bi_size -= size;
-				goto calc_subclu;
-			} else if (arg.unmapped && (map.level & L2_LEVEL)) {
-				loff_t end = to_bytes(qio->bi_iter.bi_sector) + size;
-				sector_t next;
-
-				/* Skip the following unallocated entries in one go */
-				if (!CLU_OFF(qio->qcow2, end)) {
-					next = to_sector(seek_extend_unmapped_end(qio, &map, end));
-					seek_qio_set_sector(qio, next);
-					continue;
-				}
-			}
-		}
-
-		seek_qio_next_clu(qio, &map);
-	}
-
-	while (qio)
-		qio = free_seek_qio_ret_higher(qio);
-
-	return ret;
-}
-
-loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence)
-{
-	struct qcow2 *qcow2 = to_qcow2_target(ti)->top;
-	loff_t result = -EINVAL;
-	struct qio *qio;
-	int ret;
-
-	qio = alloc_seek_qio(qcow2, NULL, qcow2->hdr.size);
-	if (!qio)
-		return -ENOMEM;
-
-	seek_qio_set_sector(qio, to_sector(offset));
-
-	ret = qcow2_llseek_hole_qio(qio, whence, &result);
-	/* In case of error remap ENXIO as it have special meaning for llseek */
-	if (ret < 0)
-		return (ret == -ENXIO) ? -EINVAL : ret;
-
-	return result;
 }

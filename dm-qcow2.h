@@ -7,6 +7,14 @@
 #include <linux/llist.h>
 #include <linux/fs.h>
 #include <linux/eventfd.h>
+#include <linux/timer.h>
+
+/* Timer API names used by newer kernels */
+#ifndef timer_container_of
+#define timer_container_of(var, callback_timer, timer_fieldname) \
+	from_timer(var, callback_timer, timer_fieldname)
+#define timer_delete_sync_try(timer) try_to_del_timer_sync(timer)
+#endif
 
 #define DM_MSG_PREFIX "qcow2"
 

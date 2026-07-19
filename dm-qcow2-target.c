@@ -8,7 +8,6 @@
 #include <linux/fs.h>
 #include <linux/error-injection.h>
 
-#include "dm.h"
 #include "dm-qcow2.h"
 
 static bool kernel_sets_dirty_bit; /* false */;
@@ -1057,7 +1056,7 @@ static void qcow2_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	limits->io_min = block_size;
 	limits->io_opt = qcow2->clu_size;
 
-	limits->fua = BLK_NO_FUA;
+	limits->features &= ~BLK_FEAT_FUA;
 }
 
 static void qcow2_status(struct dm_target *ti, status_type_t type,
@@ -1172,7 +1171,6 @@ static struct target_type qcow2_target = {
 	.resume = qcow2_resume,
 	.clone_and_map_rq = qcow2_clone_and_map,
 	.message = qcow2_message,
-	.llseek_hole = qcow2_llseek_hole,
 };
 
 static int __init dm_qcow2_init(void)
