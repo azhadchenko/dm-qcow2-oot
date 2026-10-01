@@ -1596,20 +1596,23 @@ out_lock:
 /*
  * This may be called with @qio == NULL, in case of we are
  * interesting in searching cached in memory md only.
- * This is aimed to be called not only from main kwork
- * for L1/L2 pages, so all callers looking for L1/L2
- * must care about submit_read_md_page() may return EEXIST.
  */
 static int __handle_md_page(struct qcow2 *qcow2, u64 page_id,
 			    struct qio **qio, struct md_page **ret_md)
 {
 	struct md_page *md;
+	int ret;
 
 	lockdep_assert_held(&qcow2->md_pages_lock);
+again:
 	md = qcow2_md_page_find_or_postpone(qcow2, page_id, qio);
 	if (!md) {
-		if (qio && *qio)
-			return submit_read_md_page(qcow2, qio, page_id);
+		if (qio && *qio) {
+			ret = submit_read_md_page(qcow2, qio, page_id);
+			if (unlikely(ret == -EEXIST))
+				goto again;
+			return ret;
+		}
 		return 0;
 	}
 
