@@ -3535,7 +3535,7 @@ static int prepare_cluster_discard(struct qcow2 *qcow2, struct qio **qio,
 }
 
 static int handle_metadata(struct qcow2 *qcow2, struct qio **qio,
-			   struct qcow2_map *map)
+			   struct qcow2_map *map, bool avoid_metadata_changes)
 {
 	bool write = op_is_write((*qio)->bi_op);
 	int ret;
@@ -3546,13 +3546,15 @@ static int handle_metadata(struct qcow2 *qcow2, struct qio **qio,
 
 	ret = 1;
 	if (unlikely(qcow2->backward_merge_in_process)) {
+		if (avoid_metadata_changes)
+			return 2;
 		/* Keep in mind the below may replace *qio */
 		ret = prepare_backward_merge(qcow2, qio, map, write);
 	} else if (unlikely(fake_l1cow_qio(*qio)) &&
 		(!map->clu_is_cow || (map->level & L2_LEVEL))) {
 		/* Nothing to COW or L1 is mapped exactly once */
 		qio_endio(*qio);
-		ret = 0;
+		return 0;
 	} else if (unlikely(op_is_discard((*qio)->bi_op))) {
 		/*
 		 * Discard carries no data and is advisory. If it does not
@@ -3560,13 +3562,17 @@ static int handle_metadata(struct qcow2 *qcow2, struct qio **qio,
 		 * is not present, end early.
 		 */
 		if (qio_discard_updates_metadata(qcow2, *qio, map)) {
+			if (avoid_metadata_changes)
+				return 2;
 			ret = prepare_cluster_discard(qcow2, qio, map);
 		} else if (!map->data_clu_alloced || map->clu_is_cow) {
 			qio_endio(*qio);
-			ret = 0;
+			return 0;
 		}
 	} else if (write &&
 		   (!qio_is_fully_alloced(qcow2, *qio, map) || map->clu_is_cow)) {
+		if (avoid_metadata_changes)
+			return 2;
 		if (map->clu_is_cow) {
 			/* COW to compressed or shared with snapshot cluster */
 			ret = prepare_l1l2_replace(qcow2, *qio, map);
@@ -3678,13 +3684,17 @@ err:
 	qio_endio(qio);
 }
 
-static void process_one_qio(struct qcow2 *qcow2, struct qio *qio)
+static int process_one_qio(struct qcow2 *qcow2, struct qio *qio, bool avoid_metadata_changes)
 {
 	struct qcow2_map map = { .qcow2 = qcow2, };
 	bool write;
+	int ret;
 
-	if (!handle_metadata(qcow2, &qio, &map))
-		return;
+	ret = handle_metadata(qcow2, &qio, &map, avoid_metadata_changes);
+	if (!ret)
+		return 0;
+	else if (ret == 2)
+		return 1;
 
 	/*
 	 * Merge machinery makes out of order merges for present
@@ -3696,7 +3706,7 @@ static void process_one_qio(struct qcow2 *qcow2, struct qio *qio)
 	if (unlikely(qcow2->backward_merge_in_process) &&
 	    (fake_merge_qio(qio) || qcow2_file_is_writable(qcow2))) {
 		submit_top_delta_read(&map, qio);
-		return;
+		return 0;
 	}
 
 	write = op_is_write(qio->bi_op);
@@ -3704,13 +3714,13 @@ static void process_one_qio(struct qcow2 *qcow2, struct qio *qio)
 	/* Process discard early. Don't do COW just to discard */
 	if (unlikely(op_is_discard(qio->bi_op))) {
 		issue_discard(&map, qio);
-		return;
+		return 0;
 	}
 
 	if (unlikely(map.compressed)) {
 		/* Compressed qio never uses sub-clus */
 		submit_read_compressed(&map, qio, write);
-		return;
+		return 0;
 	}
 
 	if (!write) {
@@ -3723,6 +3733,8 @@ static void process_one_qio(struct qcow2 *qcow2, struct qio *qio)
 		else
 			perform_rw_mapped(&map, qio);
 	}
+
+	return 0;
 }
 
 static struct bio_vec *create_bvec_from_rq(struct request *rq)
@@ -3825,7 +3837,7 @@ static void process_deferred_qios(struct qcow2 *qcow2, struct list_head *qios)
 			continue;
 		}
 
-		process_one_qio(qcow2, qio);
+		process_one_qio(qcow2, qio, false);
 	}
 }
 
