@@ -362,6 +362,8 @@ struct qio *qcow2_alloc_qio(mempool_t *pool, bool zero)
 }
 ALLOW_ERROR_INJECTION(qcow2_alloc_qio, NULL);
 
+static void do_qio_work(struct work_struct *ws);
+
 void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 {
 	qio->qcow2 = qcow2;
@@ -372,7 +374,9 @@ void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 	qio->bi_io_vec = NULL;
 	qio->flags = 0;
 	qio->ref_index = REF_INDEX_INVALID;
+	qio->state = QIO_STATE_START;
 	atomic_set(&qio->remaining, 1);
+	INIT_WORK(&qio->worker, do_qio_work);
 
 	/*
 	 * Initially set into BLK_STS_OK, while aio complete,
@@ -3768,10 +3772,10 @@ static void qio_init_iter_from_rq(struct qio *qio, struct request *rq)
 	qio->bi_iter.bi_bvec_done = 0;
 }
 
-static void prepare_one_embedded_qio(struct qcow2 *qcow2, struct qio *qio,
-				     struct list_head *deferred_qios)
+static void prepare_one_embedded_qio(struct qio *qio, struct list_head *deferred_qios)
 {
 	struct qcow2_rq *qrq = qio->endio_cb_data;
+	struct qcow2 *qcow2 = qio->qcow2;
 	struct request *rq = qrq->rq;
 	struct bio_vec *bvec = NULL;
 	LIST_HEAD(list);
@@ -3814,15 +3818,6 @@ static void prepare_one_embedded_qio(struct qcow2 *qcow2, struct qio *qio,
 err:
 	qio->bi_status = BLK_STS_RESOURCE;
 	qio_endio(qio);
-}
-
-static void process_embedded_qios(struct qcow2 *qcow2, struct list_head *qios,
-				  struct list_head *deferred_qios)
-{
-	struct qio *qio;
-
-	while ((qio = qio_list_pop(qios)))
-		prepare_one_embedded_qio(qcow2, qio, deferred_qios);
 }
 
 static void process_deferred_qios(struct qcow2 *qcow2, struct list_head *qios)
@@ -4341,7 +4336,6 @@ static void process_seek_qios(struct qcow2 *qcow, struct list_head *qios)
 void do_qcow2_work(struct work_struct *ws)
 {
 	struct qcow2 *qcow2 = container_of(ws, struct qcow2, worker);
-	LIST_HEAD(embedded_qios);
 	LIST_HEAD(deferred_qios);
 	LIST_HEAD(zread_qios);
 	LIST_HEAD(bwrite_qios);
@@ -4354,7 +4348,6 @@ void do_qcow2_work(struct work_struct *ws)
 
 	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
 	spin_lock_irq(&qcow2->deferred_lock);
-	list_splice_init(&qcow2->qios[QLIST_EMBEDDED], &embedded_qios);
 	list_splice_init(&qcow2->qios[QLIST_DEFERRED], &deferred_qios);
 	list_splice_init(&qcow2->qios[QLIST_ZREAD], &zread_qios);
 	list_splice_init(&qcow2->qios[QLIST_BMERGE_WRITE], &bwrite_qios);
@@ -4365,7 +4358,6 @@ void do_qcow2_work(struct work_struct *ws)
 	list_splice_init(&qcow2->qios[QLIST_SEEK], &seek_qios);
 	spin_unlock_irq(&qcow2->deferred_lock);
 
-	process_embedded_qios(qcow2, &embedded_qios, &deferred_qios);
 	process_deferred_qios(qcow2, &deferred_qios);
 	process_compressed_read(&zread_qios, &cow_data_qios);
 	process_backward_merge_write(qcow2, &bwrite_qios);
@@ -4489,7 +4481,7 @@ static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
 
 	if (blk_rq_bytes(rq)) {
 		queue_list_id = QLIST_EMBEDDED;
-		worker = &qcow2->worker;
+		worker = &qio->worker;
 	} else {
 		WARN_ON_ONCE(qio->bi_op != REQ_OP_FLUSH);
 		queue_list_id = QLIST_FLUSH;
@@ -4505,7 +4497,10 @@ static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
 		qio->qcow2 = qcow2;
 		qio->queue_list_id = queue_list_id;
 		qio->ref_index = ref_index;
-		list_add_tail(&qio->link, &qcow2->qios[qio->queue_list_id]);
+		if (queue_list_id == QLIST_EMBEDDED)
+			qio->state = QIO_STATE_START;
+		else
+			list_add_tail(&qio->link, &qcow2->qios[qio->queue_list_id]);
 	}
 	spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
 
@@ -4595,6 +4590,40 @@ static void handle_cleanup_mask(struct qio *qio)
 		mark_cluster_unused(qcow2, md, index_in_page, pos);
 		ext->cleanup_mask &= ~FREE_ALLOCATED_CLU;
 	}
+}
+
+static void do_qio_work(struct work_struct *ws)
+{
+	struct qio *qio = container_of(ws, struct qio, worker);
+	struct qcow2 *qcow2 = qio->qcow2;
+	struct qcow2_target *tgt = qcow2->tgt;
+	unsigned int pflags = current->flags;
+
+	/* Same reasons as in do_qcow2_work() */
+	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+
+	switch (qio->state) {
+	case QIO_STATE_START: {
+		LIST_HEAD(deferred_qios);
+
+		prepare_one_embedded_qio(qio, &deferred_qios);
+		if (list_empty(&deferred_qios))
+			break;
+
+		spin_lock_irq(&qcow2->deferred_lock);
+		list_splice_tail(&deferred_qios, &qcow2->qios[QLIST_DEFERRED]);
+		spin_unlock_irq(&qcow2->deferred_lock);
+		queue_work(tgt->wq, &qcow2->worker);
+		break;
+	}
+
+	default:
+		qio->bi_status = BLK_STS_IOERR;
+		qio_endio(qio);
+		break;
+	}
+
+	current_restore_flags(pflags, PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO);
 }
 
 struct qio_data_llseek_hole {

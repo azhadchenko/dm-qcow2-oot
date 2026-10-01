@@ -236,6 +236,10 @@ enum {
 	QLIST_INVALID = QLIST_COUNT,
 };
 
+enum {
+	QIO_STATE_START = 0,
+};
+
 struct qcow2 {
 	struct qcow2_target *tgt;
 	struct file *file;
@@ -369,6 +373,8 @@ struct qio {
 	struct qcow2 *qcow2;
 	qcow2_endio_t endio_cb;
 	void *endio_cb_data;
+	struct work_struct worker;
+	int state;
 };
 
 #define CLU_OFF(qcow2, pos) (pos & (qcow2->clu_size - 1))
