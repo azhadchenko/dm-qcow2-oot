@@ -2908,14 +2908,19 @@ static void perform_rw_mapped(struct qcow2_map *map, struct qio *qio)
 	 * wait for md writeback completion.
 	 *
 	 * L1/L2 pages become set and unset dirty from main work only,
-	 * so lock is not needed for MD_DIRTY/changed_indexes visibility.
+	 * but this may be called from per-qio fast path in parallel
+	 * with main work submitting the writeback and with its completion
+	 * dropping md->wbd. Check MD_DIRTY and dereference md->wbd under
+	 * md_pages_lock, so they are consistent with each other.
 	 */
 	index_in_page = map->l2.index_in_page + !!(qcow2->ext_l2);
-	if (rw == WRITE && (md->status & MD_DIRTY) &&
-	    test_bit(index_in_page, md->wbd->changed_indexes)) {
+	if (rw == WRITE) {
 		spin_lock_irqsave(&qcow2->md_pages_lock, flags);
-		md->wbd->nr_submitted++;
-		qio->data = md->wbd;
+		if ((md->status & MD_DIRTY) &&
+		    test_bit(index_in_page, md->wbd->changed_indexes)) {
+			md->wbd->nr_submitted++;
+			qio->data = md->wbd;
+		}
 		spin_unlock_irqrestore(&qcow2->md_pages_lock, flags);
 	}
 
