@@ -4592,9 +4592,19 @@ static void handle_cleanup_mask(struct qio *qio)
 	}
 }
 
+static void qio_try_fast(struct qio *qio, struct list_head *deferred_qios)
+{
+	list_del(&qio->link);
+
+	/* add qio back to the deferred list if we couldn't do it fast*/
+	if (process_one_qio(qio->qcow2, qio, true))
+		list_add(&qio->link, deferred_qios);
+}
+
 static void do_qio_work(struct work_struct *ws)
 {
 	struct qio *qio = container_of(ws, struct qio, worker);
+	struct qio *i, *next;
 	struct qcow2 *qcow2 = qio->qcow2;
 	struct qcow2_target *tgt = qcow2->tgt;
 	unsigned int pflags = current->flags;
@@ -4605,8 +4615,12 @@ static void do_qio_work(struct work_struct *ws)
 	switch (qio->state) {
 	case QIO_STATE_START: {
 		LIST_HEAD(deferred_qios);
+		LIST_HEAD(split_qios);
 
-		prepare_one_embedded_qio(qio, &deferred_qios);
+		prepare_one_embedded_qio(qio, &split_qios);
+		list_for_each_entry_safe(i, next, &split_qios, link)
+			qio_try_fast(i, &deferred_qios);
+
 		if (list_empty(&deferred_qios))
 			break;
 
