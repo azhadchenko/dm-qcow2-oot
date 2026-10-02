@@ -4398,7 +4398,11 @@ void do_qcow2_flush_work(struct work_struct *ws)
 	spin_lock_irq(&qcow2->deferred_lock);
 	list_splice_tail_init(&qcow2->qios[QLIST_FLUSH], &flush_qios);
 	spin_unlock_irq(&qcow2->deferred_lock);
-	if (WARN_ON_ONCE(list_empty(&flush_qios)))
+	/*
+	 * The work may be queued again while it is running and the running
+	 * instance has already taken the whole batch, so this is not an error.
+	 */
+	if (list_empty(&flush_qios))
 		goto out;
 
 	/*
@@ -4519,13 +4523,16 @@ static void account_data_qio(struct qcow2_target *tgt, struct qio *qio)
 {
 	u8 index;
 
+	unsigned long flags;
+
 	if (qio->flags & QIO_ACCOUNTED_DATA_FL)
 		return;
 
-	spin_lock_irq(&tgt->data_qio_lock);
+	/* Called under deferred_lock with irqs saved: must not enable irqs */
+	spin_lock_irqsave(&tgt->data_qio_lock, flags);
 	index = tgt->data_qio_index;
 	atomic_inc(&tgt->active_data_qios[index]);
-	spin_unlock_irq(&tgt->data_qio_lock);
+	spin_unlock_irqrestore(&tgt->data_qio_lock, flags);
 
 	qio->data_ref_index = index;
 	qio->flags |= QIO_ACCOUNTED_DATA_FL;
