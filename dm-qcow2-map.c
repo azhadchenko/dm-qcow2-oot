@@ -6,13 +6,10 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 #include <uapi/linux/falloc.h>
-#include <linux/blk-mq.h>
 #include <linux/zlib.h>
 #include <linux/error-injection.h>
 #include <linux/zstd.h>
 
-#include "dm.h"
-#include "dm-rq.h"
 #include "dm-qcow2.h"
 
 /* "Exactly one bit" has the same number in L1 and L2 */
@@ -85,8 +82,7 @@ static int qcow2_punch_hole(struct file *file, loff_t pos, loff_t len);
 static void handle_cleanup_mask(struct qio *qio);
 static void process_read_qio(struct qcow2 *qcow2, struct qio *qio,
 			     struct qcow2_map *map);
-static void init_qrq_and_embedded_qio(struct qcow2_target *tgt, struct request *rq,
-				      struct qcow2_rq *qrq, struct qio *qio);
+static void init_bio_qio(struct bio *bio, struct qio *qio);
 
 static loff_t bytes_off_in_cluster(struct qcow2 *qcow2, struct qio *qio)
 {
@@ -369,9 +365,15 @@ void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 	qio->ext = NULL;
 	qio->data = NULL;
 	qio->bi_op = bi_op;
+	qio->bi_opf = bi_op;
 	qio->bi_io_vec = NULL;
 	qio->flags = 0;
 	qio->ref_index = REF_INDEX_INVALID;
+	qio->data_ref_index = DATA_INDEX_INVALID;
+	qio->complete = NULL;
+	qio->endio_cb = NULL;
+	qio->endio_cb_data = NULL;
+	INIT_LIST_HEAD(&qio->link);
 	atomic_set(&qio->remaining, 1);
 
 	/*
@@ -414,6 +416,7 @@ static void do_qio_endio(struct qio *qio)
 	void *endio_cb_data = qio->endio_cb_data;
 	unsigned int flags = qio->flags;
 	u8 ref_index = qio->ref_index;
+	bool keep_ref = false;
 
 	if (!atomic_dec_and_test(&qio->remaining))
 		return;
@@ -421,9 +424,10 @@ static void do_qio_endio(struct qio *qio)
 	qio->ref_index = REF_INDEX_INVALID;
 	/* Note, that this may free qio or its container memory */
 	if (endio_cb)
-		endio_cb(tgt, qio, endio_cb_data, qio->bi_status);
+		endio_cb(tgt, qio, endio_cb_data, qio->bi_status,
+			 ref_index, &keep_ref);
 
-	if (ref_index < REF_INDEX_INVALID)
+	if (ref_index < REF_INDEX_INVALID && !keep_ref)
 		qcow2_ref_dec(tgt, ref_index);
 	if (flags & QIO_FREE_ON_ENDIO_FL)
 		qcow2_free_qio(qio, tgt->qio_pool);
@@ -466,24 +470,29 @@ void qcow2_dispatch_qios(struct qcow2 *qcow2, struct qio *qio,
 	queue_work(qcow2->tgt->wq, &qcow2->worker);
 }
 
+static void qio_set_error(struct qio *qio, blk_status_t status)
+{
+	if (status != BLK_STS_OK)
+		cmpxchg(&qio->bi_status, BLK_STS_OK, status);
+}
+
 static void end_qios(struct list_head *qio_list, blk_status_t status)
 {
 	struct qio *qio;
 
 	while ((qio = qio_list_pop(qio_list)) != NULL) {
-		if (status != BLK_STS_OK)
-			qio->bi_status = status;
+		qio_set_error(qio, status);
 		qio_endio(qio);
 	}
 }
 
 static void qio_chain_endio(struct qcow2_target *tgt, struct qio *qio,
-			    void *parent_ptr, blk_status_t bi_status)
+			    void *parent_ptr, blk_status_t bi_status,
+			    u8 ref_index, bool *keep_ref)
 {
 	struct qio *parent = parent_ptr;
 
-	if (unlikely(bi_status))
-		parent->bi_status = bi_status;
+	qio_set_error(parent, bi_status);
 
 	do_qio_endio(parent);
 }
@@ -495,6 +504,16 @@ static void qio_chain(struct qio *qio, struct qio *parent)
 	qio->endio_cb_data = parent;
 	qio->endio_cb = qio_chain_endio;
 	atomic_inc(&parent->remaining);
+}
+
+static void call_qio_endio_cb(qcow2_endio_t endio_cb,
+			      struct qcow2_target *tgt, struct qio *qio,
+			      void *data, blk_status_t bi_status)
+{
+	bool keep_ref = false;
+
+	endio_cb(tgt, qio, data, bi_status, REF_INDEX_INVALID, &keep_ref);
+	WARN_ON_ONCE(keep_ref);
 }
 
 /* Clone of bio_advance_iter() */
@@ -520,6 +539,7 @@ static struct qio *split_and_chain_qio(struct qcow2 *qcow2,
 		return NULL;
 
 	qcow2_init_qio(split, qio->bi_op, qcow2);
+	split->bi_opf = qio->bi_opf;
 	split->queue_list_id = qio->queue_list_id;
 	split->flags |= QIO_FREE_ON_ENDIO_FL;
 	split->flags |= (qio->flags & QIO_SPLIT_INHERITED_FLAGS);
@@ -565,7 +585,7 @@ static int qcow2_split_qio_to_list(struct qcow2 *qcow2, struct qio *qio,
 	return 0;
 err:
 	while ((qio = qio_list_pop(&list)) != NULL) {
-		qio->bi_status = BLK_STS_RESOURCE;
+		qio_set_error(qio, BLK_STS_RESOURCE);
 		qio_endio(qio);
 	}
 	return -ENOMEM;
@@ -1491,7 +1511,7 @@ static void md_page_read_complete(struct qio *qio)
 
 	do_md_page_read_complete(ret, qcow2, md);
 	if (ret)
-		qio->bi_status = errno_to_blk_status(ret);
+		qio_set_error(qio, errno_to_blk_status(ret));
 	kfree(qvec);
 	qio_endio(qio);
 }
@@ -2208,7 +2228,7 @@ unlock:
 
 int qcow2_truncate_safe(struct file *file, loff_t new_len)
 {
-	return do_ftruncate(file, new_len, 0);
+	return vfs_truncate(&file->f_path, new_len);
 }
 
 static int truncate_prealloc_safe(struct qcow2 *qcow2, loff_t len, const char *func)
@@ -2693,13 +2713,14 @@ static int prepare_l1l2_replace(struct qcow2 *qcow2, struct qio *qio,
 }
 
 static void backward_merge_write_complete(struct qcow2_target *tgt, struct qio *unused,
-					  void *qio_ptr, blk_status_t bi_status)
+					  void *qio_ptr, blk_status_t bi_status,
+					  u8 ref_index, bool *keep_ref)
 {
 	struct qio *qio = qio_ptr;
 	struct qcow2 *qcow2 = qio->qcow2;
 
 	if (unlikely(bi_status)) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 		return;
 	}
@@ -2718,13 +2739,14 @@ static void backward_merge_write_complete(struct qcow2_target *tgt, struct qio *
 }
 
 static void backward_merge_read_complete(struct qcow2_target *tgt, struct qio *unused,
-					 void *qio_ptr, blk_status_t bi_status)
+					 void *qio_ptr, blk_status_t bi_status,
+					 u8 ref_index, bool *keep_ref)
 {
 	struct qio *qio = qio_ptr;
 	struct qcow2 *qcow2 = qio->qcow2;
 
 	if (unlikely(bi_status)) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 		return;
 	}
@@ -2734,12 +2756,13 @@ static void backward_merge_read_complete(struct qcow2_target *tgt, struct qio *u
 }
 
 static void requeue_if_ok(struct qcow2_target *tgt, struct qio *unused,
-			  void *qio_ptr, blk_status_t bi_status)
+			  void *qio_ptr, blk_status_t bi_status,
+			  u8 ref_index, bool *keep_ref)
 {
 	struct qio *qio = qio_ptr;
 
 	if (bi_status) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 		return;
 	}
@@ -2765,7 +2788,7 @@ static int prepare_backward_merge(struct qcow2 *qcow2, struct qio **qio,
 		if (!op_is_write((*qio)->bi_op))
 			return 1;
 		if (WARN_ON_ONCE(!fake_merge_qio(*qio))) {
-			(*qio)->bi_status = BLK_STS_IOERR;
+			qio_set_error(*qio, BLK_STS_IOERR);
 			qio_endio(*qio);
 			return 0;
 		}
@@ -2793,7 +2816,7 @@ static int prepare_backward_merge(struct qcow2 *qcow2, struct qio **qio,
 		 */
 		aux_qio = qcow2_alloc_qio(qcow2->tgt->qio_pool, true);
 		if (!aux_qio) {
-			(*qio)->bi_status = BLK_STS_RESOURCE;
+			qio_set_error(*qio, BLK_STS_RESOURCE);
 			goto endio;
 		}
 
@@ -2814,7 +2837,7 @@ static int prepare_backward_merge(struct qcow2 *qcow2, struct qio **qio,
 	 */
 	ret = prepare_l1l2_replace(qcow2, *qio, map);
 	if (ret < 0) {
-		(*qio)->bi_status = errno_to_blk_status(ret);
+		qio_set_error(*qio, errno_to_blk_status(ret));
 		goto endio;
 	}
 
@@ -2881,7 +2904,7 @@ static void data_rw_complete(struct qio *qio)
 
 	if (call_endio) {
 		if (bi_status != BLK_STS_OK)
-			qio->bi_status = bi_status;
+			qio_set_error(qio, bi_status);
 		qio_endio(qio);
 	}
 	if (finalize_wbd)
@@ -2928,7 +2951,8 @@ static void perform_rw_mapped(struct qcow2_map *map, struct qio *qio)
 }
 
 static void cow_read_endio(struct qcow2_target *tgt, struct qio *unused,
-			   void *qio_ptr, blk_status_t bi_status)
+			   void *qio_ptr, blk_status_t bi_status,
+			   u8 ref_index, bool *keep_ref)
 
 {
 	struct qio *qio = qio_ptr;
@@ -2938,7 +2962,7 @@ static void cow_read_endio(struct qcow2_target *tgt, struct qio *unused,
 	dec_wpc_readers(qcow2, md); /* We ended to use shared clu on disk */
 
 	if (unlikely(bi_status)) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 		return;
 	}
@@ -2962,7 +2986,7 @@ static void submit_read_whole_cow_clu(struct qcow2_map *map, struct qio *qio)
 	nr_pages = clu_size >> PAGE_SHIFT;
 	read_qio = qcow2_alloc_qio_with_qvec(qcow2, nr_pages, REQ_OP_READ, true, &qvec);
 	if (!read_qio) {
-		qio->bi_status = BLK_STS_RESOURCE;
+		qio_set_error(qio, BLK_STS_RESOURCE);
 		qio_endio(qio); /* Frees ext */
 		return;
 	}
@@ -3153,7 +3177,8 @@ static int prepare_zcow_slices(void *buf, struct qio *qio)
 }
 
 static void compressed_read_endio(struct qcow2_target *tgt, struct qio *unused,
-				  void *qio_ptr, blk_status_t bi_status)
+				  void *qio_ptr, blk_status_t bi_status,
+				  u8 ref_index, bool *keep_ref)
 
 {
 	struct qio *qio = qio_ptr;
@@ -3166,7 +3191,7 @@ static void compressed_read_endio(struct qcow2_target *tgt, struct qio *unused,
 	 * then submitted. Decompress will fail, if we read not enough.
 	 */
 	if (bi_status) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 		return;
 	}
@@ -3215,7 +3240,7 @@ static void submit_read_compressed(struct qcow2_map *map, struct qio *qio,
 			qcow2_free_qvec_with_pages(qvec);
 			qcow2_free_qio(read_qio, tgt->qio_pool);
 		}
-		qio->bi_status = BLK_STS_RESOURCE;
+		qio_set_error(qio, BLK_STS_RESOURCE);
 		qio_endio(qio); /* Frees ext */
 		return;
 	}
@@ -3238,7 +3263,8 @@ static void submit_read_compressed(struct qcow2_map *map, struct qio *qio,
 		 * See the way process_cow_data_write()
 		 * updates qvec. Also skips extract part.
 		 */
-		cow_read_endio(qcow2->tgt, NULL, qio, BLK_STS_OK);
+		call_qio_endio_cb(cow_read_endio, qcow2->tgt, NULL, qio,
+				  BLK_STS_OK);
 		qcow2_free_qio(read_qio, tgt->qio_pool);
 		return;
 	}
@@ -3256,13 +3282,14 @@ static void submit_read_compressed(struct qcow2_map *map, struct qio *qio,
 }
 
 static void sliced_cow_read_complete(struct qcow2_target *tgt, struct qio *read_qio,
-				     void *qio_ptr, blk_status_t bi_status)
+				     void *qio_ptr, blk_status_t bi_status,
+				     u8 ref_index, bool *keep_ref)
 {
 	struct qio *qio = qio_ptr;
 	struct qcow2 *qcow2 = qio->qcow2;
 
 	if (unlikely(bi_status)) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 	} else {
 		qio->queue_list_id = QLIST_COW_DATA;
@@ -3332,7 +3359,8 @@ static void submit_read_sliced_clu(struct qcow2_map *map, struct qio *qio,
 
 	if (!nr_segs) { /* Full overwrite */
 		qio->data = NULL; /* qvec */
-		endio_cb(qcow2->tgt, NULL, qio, BLK_STS_OK);
+		call_qio_endio_cb(endio_cb, qcow2->tgt, NULL, qio,
+				  BLK_STS_OK);
 		goto out;
 	}
 
@@ -3360,7 +3388,7 @@ err_split:
 	end_qios(&list, BLK_STS_RESOURCE);
 	goto out;
 err_alloc:
-	qio->bi_status = BLK_STS_RESOURCE;
+	qio_set_error(qio, BLK_STS_RESOURCE);
 	qio_endio(qio);
 	goto out;
 
@@ -3412,7 +3440,7 @@ static void issue_discard(struct qcow2_map *map, struct qio *qio)
 		ret = qcow2_punch_hole(qcow2->file, pos, qio->bi_iter.bi_size);
 
 		if (ret) {
-			qio->bi_status = errno_to_blk_status(ret);
+			qio_set_error(qio, errno_to_blk_status(ret));
 			qio_endio(qio);
 			return;
 		}
@@ -3594,7 +3622,7 @@ static int handle_metadata(struct qcow2 *qcow2, struct qio **qio,
 
 check_err:
 	if (ret < 0) {
-		(*qio)->bi_status = errno_to_blk_status(ret);
+		qio_set_error(*qio, errno_to_blk_status(ret));
 		qio_endio(*qio);
 		ret = 0;
 	}
@@ -3680,7 +3708,7 @@ static void process_read_qio(struct qcow2 *qcow2, struct qio *qio,
 
 	return;
 err:
-	qio->bi_status = BLK_STS_RESOURCE;
+	qio_set_error(qio, BLK_STS_RESOURCE);
 	qio_endio(qio);
 }
 
@@ -3737,73 +3765,11 @@ static int process_one_qio(struct qcow2 *qcow2, struct qio *qio, bool avoid_meta
 	return 0;
 }
 
-static struct bio_vec *create_bvec_from_rq(struct request *rq)
-{
-	struct bio_vec bv, *bvec, *tmp;
-	struct req_iterator rq_iter;
-	unsigned int nr_bvec = 0;
-
-	rq_for_each_bvec(bv, rq, rq_iter)
-		nr_bvec++;
-
-	bvec = kvmalloc_array(nr_bvec, sizeof(struct bio_vec),
-			      GFP_NOIO);
-	if (!bvec)
-		goto out;
-
-	tmp = bvec;
-	rq_for_each_bvec(bv, rq, rq_iter) {
-		*tmp = bv;
-		tmp++;
-	}
-out:
-	return bvec;
-}
-
-static void qio_init_iter_from_rq(struct qio *qio, struct request *rq)
-{
-	qio->bi_iter.bi_sector = blk_rq_pos(rq);
-	qio->bi_iter.bi_size = blk_rq_bytes(rq);
-	qio->bi_iter.bi_idx = 0;
-	qio->bi_iter.bi_bvec_done = 0;
-}
-
 static void prepare_one_embedded_qio(struct qcow2 *qcow2, struct qio *qio,
 				     struct list_head *deferred_qios)
 {
-	struct qcow2_rq *qrq = qio->endio_cb_data;
-	struct request *rq = qrq->rq;
-	struct bio_vec *bvec = NULL;
-	LIST_HEAD(list);
 	int ret;
 
-	if (req_op(rq) == REQ_OP_DISCARD) {
-		qio_init_iter_from_rq(qio, rq);
-	} else if (rq->bio != rq->biotail) {
-		/*
-		 * Transform a set of bvec arrays related to bios
-		 * into a single bvec array (which we can iterate).
-		 */
-		bvec = create_bvec_from_rq(rq);
-		if (unlikely(!bvec))
-			goto err;
-		qrq->bvec = bvec;
-		qio_init_iter_from_rq(qio, rq);
-	} else {
-		/* Single bio already provides bvec array */
-		bvec = rq->bio->bi_io_vec;
-		if (!bvec && rq->bio->bi_iter.bi_size) {
-			bvec = rq->bio->bi_inline_vecs;
-			if (unlikely(!bvec)) {
-				QC_ERR(qcow2->tgt->ti, "Expecting inline bvec");
-				WARN_ON_ONCE(1);
-				goto err;
-			}
-		}
-		qio->bi_iter = rq->bio->bi_iter;
-	}
-
-	qio->bi_io_vec = bvec;
 	qio->queue_list_id = QLIST_DEFERRED;
 
 	ret = qcow2_split_qio_to_list(qcow2, qio, deferred_qios);
@@ -3812,7 +3778,7 @@ static void prepare_one_embedded_qio(struct qcow2 *qcow2, struct qio *qio,
 
 	return;
 err:
-	qio->bi_status = BLK_STS_RESOURCE;
+	qio_set_error(qio, BLK_STS_RESOURCE);
 	qio_endio(qio);
 }
 
@@ -3832,7 +3798,7 @@ static void process_deferred_qios(struct qcow2 *qcow2, struct list_head *qios)
 	while ((qio = qio_list_pop(qios))) {
 		/* Sanity: on this stage we do not expect ext */
 		if (WARN_ON_ONCE(qio->ext != NULL)) {
-			qio->bi_status = BLK_STS_IOERR;
+			qio_set_error(qio, BLK_STS_IOERR);
 			qio_endio(qio);
 			continue;
 		}
@@ -3869,7 +3835,7 @@ static int complete_metadata_writeback(struct qcow2 *qcow2)
 {
 	struct qcow2_bvec *qvec;
 	struct md_page *md;
-	int fsync_ret, ret;
+	int fsync_ret, wb_ret, ret;
 	LIST_HEAD(wb_list);
 	struct qio *qio;
 
@@ -3880,6 +3846,7 @@ static int complete_metadata_writeback(struct qcow2 *qcow2)
 		return -EAGAIN;
 
 	fsync_ret = vfs_fsync(qcow2->file, 0);
+	wb_ret = fsync_ret;
 	/* FIXME: We should reread md page on error */
 	if (unlikely(fsync_ret))
 		pr_err_ratelimited(QCOW2_FMT("can't sync md: %d"),
@@ -3893,15 +3860,35 @@ static int complete_metadata_writeback(struct qcow2 *qcow2)
 			ret = -EIO;
 		else
 			ret = fsync_ret;
+		if (ret && !wb_ret)
+			wb_ret = ret;
 
 		do_md_page_write_complete(ret, qcow2, md);
 		if (ret)
-			qio->bi_status = errno_to_blk_status(ret);
+			qio_set_error(qio, errno_to_blk_status(ret));
 		kfree(qvec);
 		qio_endio(qio);
 	}
 
-	return fsync_ret;
+	return wb_ret;
+}
+
+static bool qcow2_has_writeback_error(struct qcow2 *qcow2)
+{
+	struct rb_node *node;
+	bool error = false;
+
+	spin_lock_irq(&qcow2->md_pages_lock);
+	for (node = rb_first(&qcow2->md_pages); node; node = rb_next(node)) {
+		struct md_page *md = rb_entry(node, struct md_page, node);
+
+		if (md->status & MD_WRITEBACK_ERROR) {
+			error = true;
+			break;
+		}
+	}
+	spin_unlock_irq(&qcow2->md_pages_lock);
+	return error;
 }
 
 /* Process completed compressed READs */
@@ -3974,7 +3961,7 @@ static void process_compressed_read(struct list_head *read_list,
 		if (!for_cow || ret) {
 err:
 			if (ret)
-				qio->bi_status = errno_to_blk_status(ret);
+				qio_set_error(qio, errno_to_blk_status(ret));
 			qio_endio(qio);
 			continue;
 		}
@@ -4042,7 +4029,7 @@ err_split:
 	end_qios(list, BLK_STS_RESOURCE);
 	goto out;
 err_qio:
-	qio->bi_status = BLK_STS_RESOURCE;
+	qio_set_error(qio, BLK_STS_RESOURCE);
 	qio_endio(qio);
 	goto out;
 }
@@ -4067,7 +4054,8 @@ static void process_backward_merge_write(struct qcow2 *qcow2, struct list_head *
 }
 
 static void cow_data_write_endio(struct qcow2_target *tgt, struct qio *unused,
-				 void *qio_ptr, blk_status_t bi_status)
+				 void *qio_ptr, blk_status_t bi_status,
+				 u8 ref_index, bool *keep_ref)
 
 {
 	struct qio *qio = qio_ptr;
@@ -4076,7 +4064,7 @@ static void cow_data_write_endio(struct qcow2_target *tgt, struct qio *unused,
 	BUG_ON(!qio->ext);
 
 	if (unlikely(bi_status)) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 	} else {
 		qio->queue_list_id = QLIST_INDEXES_WRITE;
@@ -4093,7 +4081,7 @@ static void submit_cow_data_write(struct qcow2 *qcow2, struct qio *qio, loff_t p
 
 	write_qio = qcow2_alloc_qio(tgt->qio_pool, true);
 	if (!write_qio) {
-		qio->bi_status = BLK_STS_RESOURCE;
+		qio_set_error(qio, BLK_STS_RESOURCE);
 		qio_endio(qio);
 		return;
 	}
@@ -4115,7 +4103,8 @@ static void submit_cow_data_write(struct qcow2 *qcow2, struct qio *qio, loff_t p
 }
 
 static void sliced_cow_data_write_complete(struct qcow2_target *tgt, struct qio *unused,
-					   void *qio_ptr, blk_status_t bi_status)
+					   void *qio_ptr, blk_status_t bi_status,
+					   u8 ref_index, bool *keep_ref)
 
 {
 	struct qio *qio = qio_ptr;
@@ -4124,7 +4113,7 @@ static void sliced_cow_data_write_complete(struct qcow2_target *tgt, struct qio 
 	BUG_ON(!qio->ext);
 
 	if (bi_status) {
-		qio->bi_status = bi_status;
+		qio_set_error(qio, bi_status);
 		qio_endio(qio);
 	} else {
 		qio->queue_list_id = QLIST_INDEXES_WRITE;
@@ -4170,7 +4159,7 @@ static void process_cow_data_write(struct qcow2 *qcow2, struct list_head *cow_li
 		pos = allocate_cluster(qcow2, qio, &ext->r2_md,
 				       &ext->r2_index_in_page);
 		if (pos < 0) {
-			qio->bi_status = errno_to_blk_status(pos);
+			qio_set_error(qio, errno_to_blk_status(pos));
 			qio_endio(qio);
 		}
 
@@ -4229,7 +4218,7 @@ static void process_indexes_write(struct qcow2 *qcow2,
 					     &entry, arg_mask,
 					     ext->lx_level);
 		if (ret < 0) {
-			qio->bi_status = errno_to_blk_status(ret);
+			qio_set_error(qio, errno_to_blk_status(ret));
 			qio_endio(qio);
 			continue;
 		}
@@ -4385,13 +4374,53 @@ void do_qcow2_fsync_work(struct work_struct *ws)
 {
 	struct qcow2 *qcow2 = container_of(ws, struct qcow2, fsync_worker);
 	unsigned int pflags = current->flags;
-	LIST_HEAD(flush_qios);
-	int fsync_ret;
 
 	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+	complete_metadata_writeback(qcow2);
+	current_restore_flags(pflags, PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO);
+}
+
+void do_qcow2_flush_work(struct work_struct *ws)
+{
+	struct qcow2 *qcow2 = container_of(ws, struct qcow2, flush_worker);
+	struct qcow2_target *tgt = qcow2->tgt;
+	unsigned int pflags = current->flags;
+	LIST_HEAD(flush_qios);
+	u8 data_index;
+	int fsync_ret, wb_ret;
+
+	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+	mutex_lock(&tgt->flush_mutex);
+	/*
+	 * Detach a stable batch first.  Flush/FUA bios queued while this batch
+	 * is being processed remain on QLIST_FLUSH for the next invocation.
+	 */
 	spin_lock_irq(&qcow2->deferred_lock);
 	list_splice_tail_init(&qcow2->qios[QLIST_FLUSH], &flush_qios);
 	spin_unlock_irq(&qcow2->deferred_lock);
+	if (WARN_ON_ONCE(list_empty(&flush_qios)))
+		goto out;
+
+	/*
+	 * Close the current write generation.  New writes enter the other
+	 * generation and cannot starve this flush.
+	 */
+	spin_lock_irq(&tgt->data_qio_lock);
+	data_index = tgt->data_qio_index;
+	tgt->data_qio_index = !data_index;
+	spin_unlock_irq(&tgt->data_qio_lock);
+	wait_event(tgt->data_qio_wq,
+		   !atomic_read(&tgt->active_data_qios[data_index]));
+
+	/*
+	 * Refcount metadata normally uses delayed writeback.  Promote it, wait
+	 * until the regular worker submits it, and process write completions
+	 * before issuing the final fsync.
+	 */
+	del_timer_sync(&qcow2->slow_wb_timer);
+	qcow2_slow_wb_timer_fn(&qcow2->slow_wb_timer);
+	flush_work(&qcow2->worker);
+	flush_work(&qcow2->fsync_worker);
 
 	fsync_ret = complete_metadata_writeback(qcow2);
 	/*
@@ -4401,14 +4430,25 @@ void do_qcow2_fsync_work(struct work_struct *ws)
 	 */
 	if (fsync_ret == -EAGAIN)
 		fsync_ret = vfs_fsync(qcow2->file, 0);
+	flush_work(&qcow2->fsync_worker);
+	wb_ret = complete_metadata_writeback(qcow2);
+	if (!fsync_ret && wb_ret != -EAGAIN)
+		fsync_ret = wb_ret;
+	if (qcow2_has_writeback_error(qcow2))
+		fsync_ret = -EIO;
 
 	end_qios(&flush_qios, errno_to_blk_status(fsync_ret));
 
+out:
+	mutex_unlock(&tgt->flush_mutex);
 	current_restore_flags(pflags, PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO);
 }
 
-static bool qcow2_try_delay_enospc(struct qcow2_target *tgt, struct qcow2_rq *qrq, struct qio *qio)
+static bool qcow2_try_delay_enospc(struct qcow2_target *tgt, struct qio *qio)
 {
+	struct bio *bio = dm_bio_from_per_bio_data(qio, sizeof(*qio));
+	bool accounted = qio->flags & QIO_ACCOUNTED_DATA_FL;
+	u8 data_ref_index = qio->data_ref_index;
 	bool delayed = true;
 	unsigned long flags;
 
@@ -4418,7 +4458,12 @@ static bool qcow2_try_delay_enospc(struct qcow2_target *tgt, struct qcow2_rq *qr
 		goto unlock;
 	}
 
-	init_qrq_and_embedded_qio(tgt, qrq->rq, qrq, qio);
+	init_bio_qio(bio, qio);
+	if (accounted) {
+		qio->flags |= QIO_ACCOUNTED_DATA_FL;
+		qio->data_ref_index = data_ref_index;
+	}
+	qio->flags |= QIO_ENOSPC_RETRY_FL;
 
 	pr_err_once(QCOW2_FMT("underlying disk is almost full"),
 			qcow2_device_name(tgt->ti));
@@ -4434,74 +4479,142 @@ unlock:
 	return delayed;
 }
 
-static void qrq_endio(struct qcow2_target *tgt, struct qio *qio,
-		      void *qrq_ptr, blk_status_t bi_status)
+static void queue_fua_flush(struct qcow2_target *tgt, struct qio *qio,
+			    u8 ref_index)
 {
-	struct qcow2_rq *qrq = qrq_ptr;
-	struct request *rq = qrq->rq;
+	struct qcow2 *qcow2 = qio->qcow2;
+	unsigned long flags;
 
-	if (qrq->bvec)
-		kvfree(qrq->bvec);
+	WARN_ON_ONCE(qio->bi_op != REQ_OP_WRITE ||
+		     (qio->bi_opf & REQ_PREFLUSH));
+	qio->ref_index = ref_index;
+	qio->queue_list_id = QLIST_FLUSH;
+	qio->bi_opf &= ~REQ_FUA;
+	qio->bi_status = BLK_STS_OK;
+	atomic_set(&qio->remaining, 1);
+
+	spin_lock_irqsave(&qcow2->deferred_lock, flags);
+	list_add_tail(&qio->link, &qcow2->qios[QLIST_FLUSH]);
+	spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
+	queue_work(tgt->wq, &qcow2->flush_worker);
+}
+
+static void unaccount_data_qio(struct qcow2_target *tgt, struct qio *qio)
+{
+	u8 index;
+
+	if (!(qio->flags & QIO_ACCOUNTED_DATA_FL))
+		return;
+
+	qio->flags &= ~QIO_ACCOUNTED_DATA_FL;
+	index = qio->data_ref_index;
+	qio->data_ref_index = DATA_INDEX_INVALID;
+	if (WARN_ON_ONCE(index >= DATA_INDEX_INVALID))
+		return;
+	if (atomic_dec_and_test(&tgt->active_data_qios[index]))
+		wake_up_all(&tgt->data_qio_wq);
+}
+
+static void account_data_qio(struct qcow2_target *tgt, struct qio *qio)
+{
+	u8 index;
+
+	if (qio->flags & QIO_ACCOUNTED_DATA_FL)
+		return;
+
+	spin_lock_irq(&tgt->data_qio_lock);
+	index = tgt->data_qio_index;
+	atomic_inc(&tgt->active_data_qios[index]);
+	spin_unlock_irq(&tgt->data_qio_lock);
+
+	qio->data_ref_index = index;
+	qio->flags |= QIO_ACCOUNTED_DATA_FL;
+}
+
+static void bio_qio_endio(struct qcow2_target *tgt, struct qio *qio,
+			  void *unused, blk_status_t bi_status,
+			  u8 ref_index, bool *keep_ref)
+{
+	struct bio *bio = dm_bio_from_per_bio_data(qio, sizeof(*qio));
+
 	/*
-	 * Here is exit point for rq, and here we handle ENOSPC.
-	 * Embedded qios will be reinitialized like they've just
-	 * came from upper dm level, and later resubmitted after
-	 * timeout. Note, that we do not handle merge here: merge
-	 * callers receive -ENOSPC synchronous without intermediaries.
+	 * Here is the exit point for an incoming bio.  ENOSPC bios are
+	 * reinitialized and retried after a timeout unless suspend is pending.
 	 */
 	if (unlikely(bi_status == BLK_STS_NOSPC)) {
 		WARN_ON_ONCE(!op_is_write(qio->bi_op));
-		if (qcow2_try_delay_enospc(tgt, qrq, qio))
+		if (qcow2_try_delay_enospc(tgt, qio))
 			return;
 	}
 
-	mempool_free(qrq, tgt->qrq_pool);
-	dm_complete_request(rq, bi_status);
+	unaccount_data_qio(tgt, qio);
+
+	/*
+	 * DM advertises FUA together with flush support.  Complete a successful
+	 * FUA write only after the image file and its metadata are durable.
+	 * DM may pass REQ_FUA of the original bio along with its empty flush;
+	 * the flush worker has already made such a bio durable.
+	 */
+	if (likely(bi_status == BLK_STS_OK) && qio->bi_op == REQ_OP_WRITE &&
+	    (qio->bi_opf & (REQ_FUA | REQ_PREFLUSH)) == REQ_FUA) {
+		queue_fua_flush(tgt, qio, ref_index);
+		*keep_ref = true;
+		return;
+	}
+
+	bio->bi_status = bi_status;
+	bio_endio(bio);
 }
 
-static void init_qrq(struct qcow2_rq *qrq, struct request *rq)
+static void init_bio_qio(struct bio *bio, struct qio *qio)
 {
-	qrq->rq = rq;
-	qrq->bvec = NULL;
+	memset(qio, 0, sizeof(*qio));
+	qcow2_init_qio(qio, bio_op(bio), NULL);
+	qio->bi_opf = bio->bi_opf;
+	qio->bi_iter = bio->bi_iter;
+	qio->bi_io_vec = bio->bi_io_vec;
+	qio->endio_cb = bio_qio_endio;
 }
 
-static void init_qrq_and_embedded_qio(struct qcow2_target *tgt, struct request *rq,
-				      struct qcow2_rq *qrq, struct qio *qio)
+static void qcow2_submit_toplevel_qio(struct qcow2_target *tgt,
+				      struct qio *qio)
 {
-	init_qrq(qrq, rq);
-	qcow2_init_qio(qio, req_op(rq), NULL);
-
-	qio->endio_cb = qrq_endio;
-	qio->endio_cb_data = qrq;
-}
-
-static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
-{
-	struct qcow2_rq *qrq = qio->endio_cb_data;
-	struct request *rq = qrq->rq;
 	u8 queue_list_id, ref_index;
 	struct work_struct *worker;
 	struct qcow2 *qcow2;
 	unsigned long flags;
+	bool fail_retry = false;
 	bool queue = true;
 
-	qcow2 = qcow2_ref_inc(tgt, &ref_index);
+	if (qio->ref_index < REF_INDEX_INVALID) {
+		qcow2 = qio->qcow2;
+		ref_index = qio->ref_index;
+	} else {
+		qcow2 = qcow2_ref_inc(tgt, &ref_index);
+	}
 
-	if (blk_rq_bytes(rq)) {
+	if (qio->bi_iter.bi_size) {
 		queue_list_id = QLIST_EMBEDDED;
 		worker = &qcow2->worker;
 	} else {
-		WARN_ON_ONCE(qio->bi_op != REQ_OP_FLUSH);
+		WARN_ON_ONCE(!(qio->bi_opf & REQ_PREFLUSH));
 		queue_list_id = QLIST_FLUSH;
-		worker = &qcow2->fsync_worker;
+		worker = &qcow2->flush_worker;
 	}
 
 	spin_lock_irqsave(&qcow2->deferred_lock, flags);
 	if (unlikely(qcow2->pause_submitting_qios)) {
 		qcow2_ref_dec(tgt, ref_index);
-		list_add_tail(&qio->link, &qcow2->paused_qios);
+		qio->ref_index = REF_INDEX_INVALID;
+		if (qio->flags & QIO_ENOSPC_RETRY_FL)
+			fail_retry = true;
+		else
+			list_add_tail(&qio->link, &qcow2->paused_qios);
 		queue = false;
 	} else {
+		if (qio->endio_cb == bio_qio_endio &&
+		    qio->bi_iter.bi_size && op_is_write(qio->bi_op))
+			account_data_qio(tgt, qio);
 		qio->qcow2 = qcow2;
 		qio->queue_list_id = queue_list_id;
 		qio->ref_index = ref_index;
@@ -4509,36 +4622,46 @@ static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
 	}
 	spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
 
+	if (fail_retry) {
+		struct bio *bio = dm_bio_from_per_bio_data(qio, sizeof(*qio));
+
+		unaccount_data_qio(tgt, qio);
+		bio->bi_status = BLK_STS_NOSPC;
+		bio_endio(bio);
+		return;
+	}
 	if (queue)
 		queue_work(tgt->wq, worker);
 }
 
-void qcow2_submit_embedded_qios(struct qcow2_target *tgt, struct list_head *list)
+void qcow2_submit_toplevel_qios(struct qcow2_target *tgt,
+				struct list_head *list)
 {
 	struct qio *qio;
 
 	while ((qio = qio_list_pop(list)) != NULL)
-		qcow2_submit_embedded_qio(tgt, qio);
+		qcow2_submit_toplevel_qio(tgt, qio);
 }
 
-int qcow2_clone_and_map(struct dm_target *ti, struct request *rq,
-		    union map_info *info, struct request **clone)
+int qcow2_map(struct dm_target *ti, struct bio *bio)
 {
 	struct qcow2_target *tgt = to_qcow2_target(ti);
-	struct qcow2_rq *qrq;
 	struct qio *qio;
+	unsigned int op = bio_op(bio);
 
-	qrq = mempool_alloc(tgt->qrq_pool, GFP_ATOMIC);
-	if (!qrq)
+	if (unlikely(op != REQ_OP_READ && op != REQ_OP_WRITE &&
+		     op != REQ_OP_DISCARD))
 		return DM_MAPIO_KILL;
-	qio = (void *)qrq + sizeof(*qrq);
-	init_qrq_and_embedded_qio(tgt, rq, qrq, qio);
+	if (unlikely(!bio->bi_iter.bi_size &&
+		     !(bio->bi_opf & REQ_PREFLUSH)))
+		return DM_MAPIO_KILL;
+	if (unlikely(bio->bi_iter.bi_size && op != REQ_OP_DISCARD &&
+		     !bio->bi_io_vec))
+		return DM_MAPIO_KILL;
 
-	/*
-	 * Note, this qcow2_clone_and_map() may be called from atomic
-	 * context, so here we just delegate qio splitting to kwork.
-	 */
-	qcow2_submit_embedded_qio(tgt, qio);
+	qio = dm_per_bio_data(bio, sizeof(*qio));
+	init_bio_qio(bio, qio);
+	qcow2_submit_toplevel_qio(tgt, qio);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -4595,285 +4718,4 @@ static void handle_cleanup_mask(struct qio *qio)
 		mark_cluster_unused(qcow2, md, index_in_page, pos);
 		ext->cleanup_mask &= ~FREE_ALLOCATED_CLU;
 	}
-}
-
-struct qio_data_llseek_hole {
-	struct completion compl;
-	struct qio *higher;
-	loff_t lim;
-};
-
-#define SEEK_QIO_DATA(qio) ((struct qio_data_llseek_hole *)qio->data)
-
-static void seek_qio_set_sector(struct qio *qio, sector_t bi_sector)
-{
-	loff_t pos = to_bytes(bi_sector);
-	loff_t end = round_up(pos + 1, qio->qcow2->clu_size);
-
-	qio->bi_iter.bi_sector = bi_sector;
-	end = min_t(loff_t, end, SEEK_QIO_DATA(qio)->lim);
-	qio->bi_iter.bi_size = end > pos ? end - pos : 0;
-}
-
-static struct qio *alloc_seek_qio(struct qcow2 *qcow2, struct qio *parent, loff_t new_lim)
-{
-	struct qio_data_llseek_hole *data;
-	struct qio *qio;
-
-	qio = qcow2_alloc_qio(qcow2->tgt->qio_pool, true);
-	if (!qio)
-		return NULL;
-
-	qcow2_init_qio(qio, REQ_OP_READ, qcow2);
-	qio->queue_list_id = QLIST_SEEK;
-
-	data = kzalloc(sizeof(struct qio_data_llseek_hole), GFP_KERNEL);
-	if (!data) {
-		qcow2_free_qio(qio, qcow2->tgt->qio_pool);
-		return NULL;
-	}
-
-	qio->data = data;
-	init_completion(&data->compl);
-	data->lim = new_lim;
-
-	if (parent) {
-		data->higher = parent;
-		seek_qio_set_sector(qio, parent->bi_iter.bi_sector);
-	}
-
-	return qio;
-}
-
-static struct qio *free_seek_qio_ret_higher(struct qio *qio)
-{
-	struct qio *ret = SEEK_QIO_DATA(qio)->higher;
-
-	kfree(qio->data);
-	qcow2_free_qio(qio, qio->qcow2->tgt->qio_pool);
-
-	return ret;
-}
-
-static inline sector_t get_next_l2(struct qio *qio)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	u64 l2_cover = to_sector((u64)qcow2->clu_size * qcow2->l2_entries);
-
-	return round_up(qio->bi_iter.bi_sector + 1, l2_cover);
-}
-
-static inline sector_t get_next_clu(struct qio *qio)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	loff_t offset;
-
-	offset = to_bytes(qio->bi_iter.bi_sector);
-	offset = (offset + qcow2->clu_size) / qcow2->clu_size;
-	offset *= qcow2->clu_size;
-
-	return to_sector(offset);
-}
-
-static inline void seek_qio_next_clu(struct qio *qio, struct qcow2_map *map)
-{
-	sector_t bi_sector;
-
-	/*
-	 * Whole L2 table is unmapped - skip to next l2 table,
-	 * but only if there is no backing data
-	 */
-	if (map && !(map->level & L2_LEVEL) &&
-	    !maybe_mapped_in_lower_delta(qio->qcow2, qio))
-		bi_sector = get_next_l2(qio);
-	else
-		bi_sector = get_next_clu(qio);
-
-	seek_qio_set_sector(qio, bi_sector);
-}
-
-/*
- * Manually scan L2 metadata pages until we hit something interesting.
- * We do not take md_pages_lock here because we have no promises about
- * concurrent writes anyway.
- */
-static loff_t seek_extend_unmapped_end(struct qio *qio, struct qcow2_map *map,
-				       loff_t end)
-{
-	struct qcow2 *qcow2 = qio->qcow2;
-	loff_t lim = SEEK_QIO_DATA(qio)->lim;
-	u32 step = 1 + qcow2->ext_l2;
-	u32 index = map->l2.index_in_page + step;
-	u64 *entries;
-
-	entries = kmap_local_page(map->l2.md->page);
-	for (; index + step <= PAGE_SIZE / sizeof(u64) && end < lim;
-	     index += step) {
-		/* Zero test does not need be64_to_cpu() */
-		if (READ_ONCE(entries[index]) ||
-		    (qcow2->ext_l2 && READ_ONCE(entries[index + 1])))
-			break;
-		end += qcow2->clu_size;
-	}
-	kunmap_local(entries);
-
-	return min_t(loff_t, end, lim);
-}
-
-static struct qio *advance_and_spawn_lower_seek_qio(struct qio *old_qio, loff_t end)
-{
-	struct qcow2 *lower = old_qio->qcow2->lower;
-	struct qio *new_qio;
-
-	if (end > lower->hdr.size)
-		end = lower->hdr.size;
-
-	new_qio = alloc_seek_qio(lower, old_qio, end);
-	if (!new_qio)
-		return NULL;
-
-	seek_qio_set_sector(old_qio, to_sector(end));
-
-	return new_qio;
-}
-
-static int qcow2_llseek_hole_qio(struct qio *qio, int whence, loff_t *result)
-{
-	struct calc_front_bytes_ret arg;
-	struct qcow2_map map;
-	struct qio *qptr;
-	int ret;
-	u32 size;
-
-	while (1) {
-		if (to_bytes(qio->bi_iter.bi_sector) >= SEEK_QIO_DATA(qio)->lim) {
-			if (SEEK_QIO_DATA(qio)->higher) {
-				qio = free_seek_qio_ret_higher(qio);
-				continue;
-			}
-			ret = 0;
-			*result = to_bytes(qio->bi_iter.bi_sector);
-			break;
-		}
-
-		memset(&map, 0, sizeof(map));
-		map.qcow2 = qio->qcow2;
-		qptr = qio;
-
-		ret = parse_metadata(qio->qcow2, &qptr, &map);
-		if (ret < 0)
-			break;
-		if (qptr == NULL) {
-			/* one of metadata pages is not loaded and qio is postponed*/
-			wait_for_completion(&SEEK_QIO_DATA(qio)->compl);
-			reinit_completion(&SEEK_QIO_DATA(qio)->compl);
-			continue;
-		}
-
-calc_subclu:
-		size = calc_front_qio_bytes(qio->qcow2, qio, &map, &arg);
-
-		if (arg.unmapped && arg.try_lower) {
-			/*
-			 * Check if the backing image is big enough, then advance current qio
-			 * and spawn a new one for lower image
-			 */
-			if (to_bytes(qio->bi_iter.bi_sector) < qio->qcow2->lower->hdr.size) {
-				struct qio *new_qio;
-				loff_t end;
-
-				if (!(map.level & L2_LEVEL)) {
-					end = min_t(loff_t,
-						    to_bytes(get_next_l2(qio)),
-						    SEEK_QIO_DATA(qio)->lim);
-				} else {
-					end = to_bytes(qio->bi_iter.bi_sector) + size;
-					/* extend operates on cluster granularity */
-					if (!CLU_OFF(qio->qcow2, end))
-						end = seek_extend_unmapped_end(qio, &map, end);
-				}
-
-				new_qio = advance_and_spawn_lower_seek_qio(qio, end);
-				if (!new_qio) {
-					ret = -ENOMEM;
-					break;
-				}
-
-				qio = new_qio;
-				continue;
-			}
-		}
-
-		if (whence == SEEK_HOLE) {
-			if (arg.zeroes || arg.unmapped) {
-				*result = to_bytes(qio->bi_iter.bi_sector);
-				ret = 0;
-				break;
-			} else if (size != qio->bi_iter.bi_size) {
-				/*
-				 * range starts with data subclusters and after that
-				 * some subclusters are zero or unmapped
-				 */
-				*result = to_bytes(qio->bi_iter.bi_sector) + size;
-				ret = 0;
-				break;
-			}
-		}
-
-		if (whence == SEEK_DATA) {
-			if (!arg.zeroes && !arg.unmapped) {
-				*result = to_bytes(qio->bi_iter.bi_sector);
-				ret = 0;
-				break;
-			} else if (size != qio->bi_iter.bi_size) {
-				/*
-				 * range starts with zero or unmapped subclusters
-				 * but after that it still can be unmapped or zero
-				 * We do not need to parse metadata again but we should
-				 * skip this sublusters and look onto next ones
-				 */
-				qio->bi_iter.bi_sector += to_sector(size);
-				qio->bi_iter.bi_size -= size;
-				goto calc_subclu;
-			} else if (arg.unmapped && (map.level & L2_LEVEL)) {
-				loff_t end = to_bytes(qio->bi_iter.bi_sector) + size;
-				sector_t next;
-
-				/* Skip the following unallocated entries in one go */
-				if (!CLU_OFF(qio->qcow2, end)) {
-					next = to_sector(seek_extend_unmapped_end(qio, &map, end));
-					seek_qio_set_sector(qio, next);
-					continue;
-				}
-			}
-		}
-
-		seek_qio_next_clu(qio, &map);
-	}
-
-	while (qio)
-		qio = free_seek_qio_ret_higher(qio);
-
-	return ret;
-}
-
-loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence)
-{
-	struct qcow2 *qcow2 = to_qcow2_target(ti)->top;
-	loff_t result = -EINVAL;
-	struct qio *qio;
-	int ret;
-
-	qio = alloc_seek_qio(qcow2, NULL, qcow2->hdr.size);
-	if (!qio)
-		return -ENOMEM;
-
-	seek_qio_set_sector(qio, to_sector(offset));
-
-	ret = qcow2_llseek_hole_qio(qio, whence, &result);
-	/* In case of error remap ENXIO as it have special meaning for llseek */
-	if (ret < 0)
-		return (ret == -ENXIO) ? -EINVAL : ret;
-
-	return result;
 }

@@ -8,15 +8,12 @@
 #include <linux/fs.h>
 #include <linux/error-injection.h>
 
-#include "dm.h"
 #include "dm-qcow2.h"
 
 static bool kernel_sets_dirty_bit; /* false */;
 module_param(kernel_sets_dirty_bit, bool, 0444);
 MODULE_PARM_DESC(kernel_sets_dirty_bit,
 		"Dirty bit is set by kernel, not by userspace");
-
-static struct kmem_cache *qrq_cache;
 
 static void qcow2_set_service_operations(struct dm_target *ti, bool allowed)
 {
@@ -178,8 +175,8 @@ void qcow2_flush_deferred_activity(struct qcow2_target *tgt, struct qcow2 *qcow2
 	 * may start timer again after failed wb.
 	 */
 	for (i = 0; i < 2; i++) {
-		if (timer_delete_sync_try(&qcow2->slow_wb_timer) != -1)
-			qcow2_slow_wb_timer_fn(&qcow2->slow_wb_timer);
+		timer_delete_sync(&qcow2->slow_wb_timer);
+		qcow2_slow_wb_timer_fn(&qcow2->slow_wb_timer);
 		/* Start md writeback */
 		flush_workqueue(tgt->wq);
 		/* Wait AIO of md wb */
@@ -256,7 +253,6 @@ static void qcow2_tgt_destroy(struct qcow2_target *tgt)
 	qcow2_merge_backward_cancel(tgt);
 
 	mempool_destroy(tgt->qio_pool);
-	mempool_destroy(tgt->qrq_pool);
 
 	for (i = 0; i < 2; i++)
 		percpu_ref_exit(&tgt->inflight_ref[i]);
@@ -442,7 +438,7 @@ static void qcow2_enospc_timer(struct timer_list *timer)
 	list_splice_init(&tgt->enospc_qios, &list);
 	spin_unlock_irqrestore(&tgt->event_lock, flags);
 
-	qcow2_submit_embedded_qios(tgt, &list);
+	qcow2_submit_toplevel_qios(tgt, &list);
 }
 
 static void qcow2_event_work(struct work_struct *ws)
@@ -461,11 +457,9 @@ static struct qcow2_target *alloc_qcow2_target(struct dm_target *ti)
 	tgt = kzalloc(sizeof(*tgt), GFP_KERNEL);
 	if (!tgt)
 		return NULL;
-	tgt->qrq_pool = mempool_create_slab_pool(QCOW2_QRQ_POOL_SIZE,
-						 qrq_cache);
 	tgt->qio_pool = mempool_create_kmalloc_pool(MIN_QIOS,
 						    sizeof(struct qio));
-	if (!tgt->qrq_pool || !tgt->qio_pool) {
+	if (!tgt->qio_pool) {
 		ti->error = "Can't create mempool";
 		goto out_target;
 	}
@@ -490,8 +484,13 @@ static struct qcow2_target *alloc_qcow2_target(struct dm_target *ti)
 
 	init_completion(&tgt->inflight_ref_comp);
 	spin_lock_init(&tgt->event_lock);
+	spin_lock_init(&tgt->data_qio_lock);
 	mutex_init(&tgt->ctl_mutex);
+	mutex_init(&tgt->flush_mutex);
+	for (i = 0; i < 2; i++)
+		atomic_set(&tgt->active_data_qios[i], 0);
 	init_waitqueue_head(&tgt->service_wq);
+	init_waitqueue_head(&tgt->data_qio_wq);
 	INIT_WORK(&tgt->event_work, qcow2_event_work);
 	INIT_LIST_HEAD(&tgt->enospc_qios);
 	timer_setup(&tgt->enospc_timer, qcow2_enospc_timer, 0);
@@ -507,7 +506,6 @@ out_wq:
 	destroy_workqueue(tgt->wq);
 out_pool:
 	mempool_destroy(tgt->qio_pool);
-	mempool_destroy(tgt->qrq_pool);
 out_target:
 	kfree(tgt);
 	return NULL;
@@ -518,7 +516,7 @@ static int qcow2_check_convert_hdr(struct dm_target *ti,
 				   struct QCowHeader *hdr,
 				   u64 min_len, u64 max_len)
 {
-	bool ext_l2, is_ro;
+	bool ext_l2;
 	u32 clu_size;
 
 	hdr->magic = cpu_to_be32(raw_hdr->magic);
@@ -565,11 +563,6 @@ static int qcow2_check_convert_hdr(struct dm_target *ti,
 	hdr->refcount_order = be32_to_cpu(raw_hdr->refcount_order);
 	hdr->header_length = be32_to_cpu(raw_hdr->header_length);
 
-	is_ro = !(dm_table_get_mode(ti->table) & FMODE_WRITE);
-
-//	if (!is_ro && kernel_sets_dirty_bit !=
-//	    !(hdr->incompatible_features & INCOMPATIBLE_FEATURES_DIRTY_BIT))
-//		return kernel_sets_dirty_bit ? -EUCLEAN : -ENOLCK;
 	if (hdr->incompatible_features &
 	    ~(INCOMPATIBLE_FEATURES_EXTL2_BIT|INCOMPATIBLE_FEATURES_DIRTY_BIT|
 	      INCOMPATIBLE_FEATURES_COMPRESSION))
@@ -671,6 +664,7 @@ static struct qcow2 *qcow2_alloc_delta(struct qcow2_target *tgt, struct qcow2 *u
 	timer_setup(&qcow2->slow_wb_timer, qcow2_slow_wb_timer_fn, 0);
 	INIT_WORK(&qcow2->worker, do_qcow2_work);
 	INIT_WORK(&qcow2->fsync_worker, do_qcow2_fsync_work);
+	INIT_WORK(&qcow2->flush_worker, do_qcow2_flush_work);
 
 	if (upper)
 		upper->lower = qcow2;
@@ -997,6 +991,7 @@ static int qcow2_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_flush_bios = 1;
 	ti->discards_supported = true;
 	ti->num_discard_bios = 1;
+	ti->per_io_data_size = sizeof(struct qio);
 	QC_INFO(ti, "created");
 	return 0;
 err:
@@ -1057,7 +1052,7 @@ static void qcow2_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	limits->io_min = block_size;
 	limits->io_opt = qcow2->clu_size;
 
-	limits->fua = BLK_NO_FUA;
+	limits->features &= ~BLK_FEAT_FUA;
 }
 
 static void qcow2_status(struct dm_target *ti, status_type_t type,
@@ -1093,8 +1088,8 @@ static void qcow2_presuspend(struct dm_target *ti)
 
 	qcow2_set_service_operations(ti, false);
 	qcow2_set_wants_suspend(ti, true);
-	if (timer_delete_sync_try(&tgt->enospc_timer) != -1)
-		qcow2_enospc_timer(&tgt->enospc_timer);
+	timer_delete_sync(&tgt->enospc_timer);
+	qcow2_enospc_timer(&tgt->enospc_timer);
 }
 static void qcow2_presuspend_undo(struct dm_target *ti)
 {
@@ -1170,31 +1165,18 @@ static struct target_type qcow2_target = {
 	.postsuspend = qcow2_postsuspend,
 	.preresume = qcow2_preresume,
 	.resume = qcow2_resume,
-	.clone_and_map_rq = qcow2_clone_and_map,
+	.map = qcow2_map,
 	.message = qcow2_message,
-	.llseek_hole = qcow2_llseek_hole,
 };
 
 static int __init dm_qcow2_init(void)
 {
-	int ret;
-
-	qrq_cache = kmem_cache_create("qcow2-qrq", sizeof(struct qcow2_rq) +
-				      sizeof(struct qio), 0, 0, NULL);
-	if (!qrq_cache)
-		return -ENOMEM;
-
-	ret = dm_register_target(&qcow2_target);
-	if (ret)
-		kmem_cache_destroy(qrq_cache);
-
-	return ret;
+	return dm_register_target(&qcow2_target);
 }
 
 static void __exit dm_qcow2_exit(void)
 {
 	dm_unregister_target(&qcow2_target);
-	kmem_cache_destroy(qrq_cache);
 }
 
 module_init(dm_qcow2_init);

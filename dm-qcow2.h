@@ -6,6 +6,14 @@
 #include <linux/device-mapper.h>
 #include <linux/fs.h>
 #include <linux/eventfd.h>
+#include <linux/timer.h>
+
+/* Timer API names used by newer kernels */
+#ifndef timer_container_of
+#define timer_container_of(var, callback_timer, timer_fieldname) \
+	from_timer(var, callback_timer, timer_fieldname)
+#define timer_delete_sync_try(timer) try_to_del_timer_sync(timer)
+#endif
 
 #define DM_MSG_PREFIX "qcow2"
 
@@ -183,12 +191,10 @@ struct qcow2_backward_merge {
 
 struct qcow2_target {
 	struct dm_target *ti;
-#define QCOW2_QRQ_POOL_SIZE 512 /* Twice nr_requests from blk_mq_init_sched() */
-	mempool_t *qrq_pool;
 	mempool_t *qio_pool;
 	/*
-	 * start_processing_qrq() is the only place during IO handling,
-	 * where it's allowed to dereference @top. See backward merge.
+	 * Top-level qio submission is the only place during IO handling where
+	 * it is allowed to dereference @top. See backward merge.
 	 */
 	struct qcow2 *top;
 	struct workqueue_struct *wq;
@@ -205,6 +211,10 @@ struct qcow2_target {
 
 	atomic_t service_qios;
 	struct wait_queue_head service_wq;
+	atomic_t active_data_qios[2];
+	unsigned int data_qio_index:1;
+	spinlock_t data_qio_lock;
+	struct wait_queue_head data_qio_wq;
 
 	struct list_head enospc_qios; /* Delayed after ENOSPC */
 	struct timer_list enospc_timer;
@@ -212,14 +222,15 @@ struct qcow2_target {
 	struct work_struct event_work;
 	spinlock_t event_lock;
 	struct mutex ctl_mutex;
+	struct mutex flush_mutex;
 
 	struct qcow2_backward_merge backward_merge;
 };
 
 enum {
 	QLIST_EMBEDDED = 0, /*
-			     * List for initial setup embedded qios
-			     * related to prq (in process context).
+			     * List for initial setup of qios embedded in
+			     * incoming bios (in process context).
 			     * This is used only for top qcow2 image.
 			     */
 	QLIST_DEFERRED,
@@ -280,6 +291,7 @@ struct qcow2 {
 
 	struct work_struct worker;
 	struct work_struct fsync_worker;
+	struct work_struct flush_worker;
 };
 
 static inline const char *qcow2_device_name(struct dm_target *ti)
@@ -325,21 +337,19 @@ struct qio_ext {
 	u16 cow_segs;
 };
 
-struct qcow2_rq {
-	struct request *rq;
-	struct bio_vec *bvec;
-};
-
 struct qio;
 typedef void (*qcow2_endio_t)(struct qcow2_target *, struct qio *,
-			      void *, blk_status_t);
+			      void *, blk_status_t, u8, bool *);
 
 struct qio {
 	struct bvec_iter bi_iter;
 	struct bio_vec *bi_io_vec;
 	unsigned int bi_op;
+	unsigned int bi_opf;
 	blk_status_t bi_status;
 #define QIO_FREE_ON_ENDIO_FL	(1 << 0) /* Free this qio memory from qio_endio() */
+#define QIO_ACCOUNTED_DATA_FL	(1 << 1) /* Incoming data bio is accounted */
+#define QIO_ENOSPC_RETRY_FL	(1 << 2) /* Incoming bio is an ENOSPC retry */
 #define QIO_IS_MERGE_FL		(1 << 3) /* This is service merge qio */
 #define QIO_IS_DISCARD_FL	(1 << 4) /* This zeroes index (discard or backward merge) */
 #define QIO_IS_L1COW_FL		(1 << 5) /* This qio only wants COW at L1 */
@@ -347,6 +357,8 @@ struct qio {
 	u8 flags;
 #define REF_INDEX_INVALID 2
 	u8 ref_index:2;
+#define DATA_INDEX_INVALID 2
+	u8 data_ref_index:2;
 	/*
 	 * Some operations (say, COW) have more than one stage.
 	 * In case of a stage may delay bio (say, it may want
@@ -378,12 +390,12 @@ void qcow2_destroy(struct qcow2 *qcow2);
 int qcow2_set_image_file_features(struct qcow2 *qcow2, bool dirty);
 int qcow2_message(struct dm_target *ti, unsigned int argc, char **argv,
 		  char *result, unsigned int maxlen);
-int qcow2_clone_and_map(struct dm_target *ti, struct request *rq,
-		   union map_info *info, struct request **clone);
+int qcow2_map(struct dm_target *ti, struct bio *bio);
 loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence);
 
 void do_qcow2_work(struct work_struct *ws);
 void do_qcow2_fsync_work(struct work_struct *ws);
+void do_qcow2_flush_work(struct work_struct *ws);
 int qcow2_alloc_and_insert_md_page(struct qcow2 *qcow2, u64 index,
 					struct md_page **md);
 struct md_page *qcow2_md_page_find_or_postpone(struct qcow2 *qcow2,
@@ -403,7 +415,8 @@ struct qio *qcow2_alloc_qio(mempool_t *pool, bool zero);
 void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2);
 void qcow2_dispatch_qios(struct qcow2 *qcow2, struct qio *qio,
 		   struct list_head *qio_list);
-void qcow2_submit_embedded_qios(struct qcow2_target *tgt, struct list_head *list);
+void qcow2_submit_toplevel_qios(struct qcow2_target *tgt,
+				struct list_head *list);
 struct qcow2 *qcow2_ref_inc(struct qcow2_target *tgt, u8 *ref_index);
 void qcow2_ref_dec(struct qcow2_target *tgt, u8 ref_index);
 int qcow2_inflight_ref_switch(struct qcow2_target *tgt);

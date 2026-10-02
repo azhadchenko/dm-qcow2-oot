@@ -43,7 +43,8 @@ int qcow2_inflight_ref_switch(struct qcow2_target *tgt)
 }
 
 static void service_qio_endio(struct qcow2_target *tgt, struct qio *qio,
-			      void *data, blk_status_t status)
+			      void *data, blk_status_t status,
+			      u8 ref_index, bool *keep_ref)
 {
 	blk_status_t *status_ptr = data;
 
@@ -180,7 +181,7 @@ static void set_backward_merge_in_process(struct qcow2_target *tgt,
 	list_splice_init(&qcow2->paused_qios, &list);
 	spin_unlock_irq(&qcow2->deferred_lock);
 
-	qcow2_submit_embedded_qios(tgt, &list);
+	qcow2_submit_toplevel_qios(tgt, &list);
 }
 
 static void __backward_merge_update_stage(struct qcow2_target *tgt,
