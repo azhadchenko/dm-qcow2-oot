@@ -1159,7 +1159,7 @@ static void qcow2_resume(struct dm_target *ti)
 static struct target_type qcow2_target = {
 	.name = "qcow2",
 	.version = {1, 0, 0},
-	.features = DM_TARGET_SINGLETON,
+	.features = DM_TARGET_SINGLETON | DM_TARGET_NOWAIT,
 	.module = THIS_MODULE,
 	.ctr = qcow2_ctr,
 	.dtr = qcow2_dtr,
