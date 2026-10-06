@@ -4583,14 +4583,170 @@ static void init_bio_qio(struct bio *bio, struct qio *qio)
 	qio->endio_cb = bio_qio_endio;
 }
 
+static void qio_try_fast(struct qio *qio, struct list_head *deferred_qios)
+{
+	list_del(&qio->link);
+	/* Add qio back to the deferred list if we couldn't do it fast */
+	if (process_one_qio(qio->qcow2, qio, true))
+		list_add_tail(&qio->link, deferred_qios);
+}
+
+/*
+ * Fast path: split a top-level data qio and process the parts which
+ * need neither not cached metadata nor metadata changes right away;
+ * the rest is deferred to the main worker as before.
+ */
+static void process_fast_qio(struct qio *qio)
+{
+	struct qcow2 *qcow2 = qio->qcow2;
+	struct qcow2_target *tgt = qcow2->tgt;
+	struct qio *i, *next;
+	unsigned long flags;
+	LIST_HEAD(split_qios);
+	LIST_HEAD(deferred_qios);
+
+	prepare_one_embedded_qio(qcow2, qio, &split_qios);
+	list_for_each_entry_safe(i, next, &split_qios, link)
+		qio_try_fast(i, &deferred_qios);
+
+	if (!list_empty(&deferred_qios)) {
+		spin_lock_irqsave(&qcow2->deferred_lock, flags);
+		list_splice_tail(&deferred_qios, &qcow2->qios[QLIST_DEFERRED]);
+		spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
+		queue_work(tgt->wq, &qcow2->worker);
+	}
+}
+
+/*
+ * Fast path workers.
+ *
+ * Data qios are processed from per-cpu batches: the submitter adds the
+ * qio to the llist of its cpu and queues the per-cpu work only on
+ * idle->busy transition; the work drains the list until it is empty.
+ * This way one queue_work()/wakeup serves a whole batch, and nothing is
+ * queued while the work is already running (a queue_work() on a running
+ * unbound work item wakes up another idle kworker just to find out the
+ * work is busy elsewhere). The lists and works are module-global, so
+ * nothing here scales with the number of devices.
+ */
+struct qcow2_fast_cpu {
+	struct llist_head qios;
+	struct work_struct work;
+	atomic_t busy;
+};
+
+static struct qcow2_fast_cpu __percpu *qcow2_fast;
+static struct workqueue_struct *qcow2_fast_wq;
+
+static void qcow2_fast_submit(struct qio *qio)
+{
+	struct qcow2_fast_cpu *fc = get_cpu_ptr(qcow2_fast);
+
+	llist_add(&qio->fast_link, &fc->qios);
+	/* Pairs with smp_mb() in qcow2_fast_work() */
+	smp_mb();
+	if (!atomic_read(&fc->busy) && atomic_cmpxchg(&fc->busy, 0, 1) == 0)
+		queue_work(qcow2_fast_wq, &fc->work);
+	put_cpu_ptr(qcow2_fast);
+}
+
+static void qcow2_fast_work(struct work_struct *work)
+{
+	struct qcow2_fast_cpu *fc = container_of(work, struct qcow2_fast_cpu, work);
+	unsigned int pflags = current->flags;
+	struct llist_node *node;
+	struct qio *qio, *next;
+
+	/* Same reasons as in do_qcow2_work() */
+	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+
+	for (;;) {
+		node = llist_del_all(&fc->qios);
+		if (!node) {
+			atomic_set(&fc->busy, 0);
+			/*
+			 * Pairs with smp_mb() in qcow2_fast_submit(): the store
+			 * above must be visible before we look at the list, and
+			 * atomic_set() is a plain store, so a full barrier is
+			 * required (smp_mb__after_atomic() is not enough here).
+			 */
+			smp_mb();
+			if (llist_empty(&fc->qios))
+				break;
+			/* Raced with a submitter: either it queues us or we go on */
+			if (atomic_cmpxchg(&fc->busy, 0, 1) != 0)
+				break;
+			continue;
+		}
+		node = llist_reverse_order(node); /* FIFO */
+		llist_for_each_entry_safe(qio, next, node, fast_link)
+			process_fast_qio(qio);
+	}
+
+	current_restore_flags(pflags, PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO);
+}
+
+void qcow2_fast_exit(void)
+{
+	struct qcow2_fast_cpu *fc;
+	int cpu;
+
+	if (qcow2_fast_wq)
+		destroy_workqueue(qcow2_fast_wq);
+	qcow2_fast_wq = NULL;
+	if (!qcow2_fast)
+		return;
+	for_each_possible_cpu(cpu) {
+		fc = per_cpu_ptr(qcow2_fast, cpu);
+		WARN_ON_ONCE(!llist_empty(&fc->qios));
+	}
+	free_percpu(qcow2_fast);
+	qcow2_fast = NULL;
+}
+
+int qcow2_fast_init(void)
+{
+	struct qcow2_fast_cpu *fc;
+	int cpu;
+
+	qcow2_fast = alloc_percpu(struct qcow2_fast_cpu);
+	if (!qcow2_fast)
+		return -ENOMEM;
+	for_each_possible_cpu(cpu) {
+		fc = per_cpu_ptr(qcow2_fast, cpu);
+		init_llist_head(&fc->qios);
+		INIT_WORK(&fc->work, qcow2_fast_work);
+		atomic_set(&fc->busy, 0);
+	}
+
+	/*
+	 * Not WQ_HIGHPRI: nice -20 kworkers preempt the submitters, which
+	 * is measurably slower with many of them.
+	 */
+	qcow2_fast_wq = alloc_workqueue("qcow2-fast",
+					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!qcow2_fast_wq) {
+		qcow2_fast_exit();
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+/*
+ * @fast: hand data qios to the fast path workers. Only for qios coming
+ * from qcow2_map(); resubmitted (paused, enospc retry) qios go through
+ * the main worker as before.
+ */
 static void qcow2_submit_toplevel_qio(struct qcow2_target *tgt,
-				      struct qio *qio)
+				      struct qio *qio, bool fast)
 {
 	u8 queue_list_id, ref_index;
 	struct work_struct *worker;
 	struct qcow2 *qcow2;
 	unsigned long flags;
 	bool fail_retry = false;
+	bool do_fast = false;
 	bool queue = true;
 
 	if (qio->ref_index < REF_INDEX_INVALID) {
@@ -4625,7 +4781,12 @@ static void qcow2_submit_toplevel_qio(struct qcow2_target *tgt,
 		qio->qcow2 = qcow2;
 		qio->queue_list_id = queue_list_id;
 		qio->ref_index = ref_index;
-		list_add_tail(&qio->link, &qcow2->qios[qio->queue_list_id]);
+		if (fast && queue_list_id == QLIST_EMBEDDED) {
+			queue = false;
+			do_fast = true;
+		} else {
+			list_add_tail(&qio->link, &qcow2->qios[qio->queue_list_id]);
+		}
 	}
 	spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
 
@@ -4639,6 +4800,8 @@ static void qcow2_submit_toplevel_qio(struct qcow2_target *tgt,
 	}
 	if (queue)
 		queue_work(tgt->wq, worker);
+	else if (do_fast)
+		qcow2_fast_submit(qio);
 }
 
 void qcow2_submit_toplevel_qios(struct qcow2_target *tgt,
@@ -4647,7 +4810,7 @@ void qcow2_submit_toplevel_qios(struct qcow2_target *tgt,
 	struct qio *qio;
 
 	while ((qio = qio_list_pop(list)) != NULL)
-		qcow2_submit_toplevel_qio(tgt, qio);
+		qcow2_submit_toplevel_qio(tgt, qio, false);
 }
 
 int qcow2_map(struct dm_target *ti, struct bio *bio)
@@ -4668,7 +4831,7 @@ int qcow2_map(struct dm_target *ti, struct bio *bio)
 
 	qio = dm_per_bio_data(bio, sizeof(*qio));
 	init_bio_qio(bio, qio);
-	qcow2_submit_toplevel_qio(tgt, qio);
+	qcow2_submit_toplevel_qio(tgt, qio, true);
 	return DM_MAPIO_SUBMITTED;
 }
 

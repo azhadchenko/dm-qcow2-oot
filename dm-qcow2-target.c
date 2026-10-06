@@ -1154,7 +1154,13 @@ static void qcow2_resume(struct dm_target *ti)
 static struct target_type qcow2_target = {
 	.name = "qcow2",
 	.version = {1, 0, 0},
-	.features = DM_TARGET_SINGLETON,
+	/*
+	 * NOWAIT: map() never waits for I/O: data qios are handed to the
+	 * fast path workers, flushes to the flush worker. Without the flag
+	 * the device lacks BLK_FEAT_NOWAIT and io_uring punts every request
+	 * to io-wq threads.
+	 */
+	.features = DM_TARGET_SINGLETON | DM_TARGET_NOWAIT,
 	.module = THIS_MODULE,
 	.ctr = qcow2_ctr,
 	.dtr = qcow2_dtr,
@@ -1171,12 +1177,21 @@ static struct target_type qcow2_target = {
 
 static int __init dm_qcow2_init(void)
 {
-	return dm_register_target(&qcow2_target);
+	int ret;
+
+	ret = qcow2_fast_init();
+	if (ret)
+		return ret;
+	ret = dm_register_target(&qcow2_target);
+	if (ret)
+		qcow2_fast_exit();
+	return ret;
 }
 
 static void __exit dm_qcow2_exit(void)
 {
 	dm_unregister_target(&qcow2_target);
+	qcow2_fast_exit();
 }
 
 module_init(dm_qcow2_init);

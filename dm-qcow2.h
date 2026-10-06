@@ -2,6 +2,7 @@
 #ifndef __DM_QCOW2_H
 #define __DM_QCOW2_H
 
+#include <linux/llist.h>
 #include <linux/percpu-refcount.h>
 #include <linux/device-mapper.h>
 #include <linux/fs.h>
@@ -378,6 +379,7 @@ struct qio {
 	/* Some operations (COW) require special destruction or requeue */
 	struct qio_ext *ext;
 	struct list_head link;
+	struct llist_node fast_link;
 	struct qcow2 *qcow2;
 	qcow2_endio_t endio_cb;
 	void *endio_cb_data;
@@ -391,6 +393,8 @@ int qcow2_set_image_file_features(struct qcow2 *qcow2, bool dirty);
 int qcow2_message(struct dm_target *ti, unsigned int argc, char **argv,
 		  char *result, unsigned int maxlen);
 int qcow2_map(struct dm_target *ti, struct bio *bio);
+int qcow2_fast_init(void);
+void qcow2_fast_exit(void);
 loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence);
 
 void do_qcow2_work(struct work_struct *ws);
