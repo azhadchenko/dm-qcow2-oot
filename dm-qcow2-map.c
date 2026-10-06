@@ -87,6 +87,7 @@ static void process_read_qio(struct qcow2 *qcow2, struct qio *qio,
 			     struct qcow2_map *map);
 static void init_qrq_and_embedded_qio(struct qcow2_target *tgt, struct request *rq,
 				      struct qcow2_rq *qrq, struct qio *qio);
+static void qcow2_fast_submit(struct qio *qio);
 
 static loff_t bytes_off_in_cluster(struct qcow2 *qcow2, struct qio *qio)
 {
@@ -362,8 +363,6 @@ struct qio *qcow2_alloc_qio(mempool_t *pool, bool zero)
 }
 ALLOW_ERROR_INJECTION(qcow2_alloc_qio, NULL);
 
-static void do_qio_work(struct work_struct *ws);
-
 void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 {
 	qio->qcow2 = qcow2;
@@ -376,7 +375,6 @@ void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 	qio->ref_index = REF_INDEX_INVALID;
 	qio->state = QIO_STATE_START;
 	atomic_set(&qio->remaining, 1);
-	INIT_WORK(&qio->worker, do_qio_work);
 
 	/*
 	 * Initially set into BLK_STS_OK, while aio complete,
@@ -4481,7 +4479,7 @@ static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
 
 	if (blk_rq_bytes(rq)) {
 		queue_list_id = QLIST_EMBEDDED;
-		worker = &qio->worker;
+		worker = NULL;
 	} else {
 		WARN_ON_ONCE(qio->bi_op != REQ_OP_FLUSH);
 		queue_list_id = QLIST_FLUSH;
@@ -4504,8 +4502,13 @@ static void qcow2_submit_embedded_qio(struct qcow2_target *tgt, struct qio *qio)
 	}
 	spin_unlock_irqrestore(&qcow2->deferred_lock, flags);
 
-	if (queue)
+	if (!queue)
+		return;
+
+	if (worker)
 		queue_work(tgt->wq, worker);
+	else
+		qcow2_fast_submit(qio);
 }
 
 void qcow2_submit_embedded_qios(struct qcow2_target *tgt, struct list_head *list)
@@ -4601,16 +4604,11 @@ static void qio_try_fast(struct qio *qio, struct list_head *deferred_qios)
 		list_add(&qio->link, deferred_qios);
 }
 
-static void do_qio_work(struct work_struct *ws)
+static void process_fast_qio(struct qio *qio)
 {
-	struct qio *qio = container_of(ws, struct qio, worker);
-	struct qio *i, *next;
 	struct qcow2 *qcow2 = qio->qcow2;
 	struct qcow2_target *tgt = qcow2->tgt;
-	unsigned int pflags = current->flags;
-
-	/* Same reasons as in do_qcow2_work() */
-	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+	struct qio *i, *next;
 
 	switch (qio->state) {
 	case QIO_STATE_START: {
@@ -4636,8 +4634,100 @@ static void do_qio_work(struct work_struct *ws)
 		qio_endio(qio);
 		break;
 	}
+}
+
+struct qcow2_fast_cpu {
+	struct llist_head qios;
+	struct work_struct work;
+	atomic_t busy;
+};
+
+static struct qcow2_fast_cpu __percpu *qcow2_fast;
+static struct workqueue_struct *qcow2_fast_wq;
+
+static void qcow2_fast_submit(struct qio *qio)
+{
+	struct qcow2_fast_cpu *fc = get_cpu_ptr(qcow2_fast);
+
+	llist_add(&qio->fast_link, &fc->qios);
+	/* Pairs with smp_mb() in qcow2_fast_work() */
+	smp_mb();
+	if (!atomic_read(&fc->busy) && atomic_cmpxchg(&fc->busy, 0, 1) == 0)
+		queue_work(qcow2_fast_wq, &fc->work);
+	put_cpu_ptr(qcow2_fast);
+}
+
+static void qcow2_fast_work(struct work_struct *work)
+{
+	struct qcow2_fast_cpu *fc = container_of(work, struct qcow2_fast_cpu, work);
+	unsigned int pflags = current->flags;
+	struct llist_node *node;
+	struct qio *qio, *next;
+
+	/* Same reasons as in do_qcow2_work() */
+	current->flags |= PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO;
+
+	for (;;) {
+		node = llist_del_all(&fc->qios);
+		if (!node) {
+			atomic_set(&fc->busy, 0);
+			/* just to be sure we look at the list after busy is posted */
+			smp_mb();
+			if (llist_empty(&fc->qios))
+				break;
+			if (atomic_cmpxchg(&fc->busy, 0, 1) != 0)
+				break;
+			continue;
+		}
+		node = llist_reverse_order(node);
+		llist_for_each_entry_safe(qio, next, node, fast_link)
+			process_fast_qio(qio);
+	}
 
 	current_restore_flags(pflags, PF_LOCAL_THROTTLE|PF_MEMALLOC_NOIO);
+}
+
+void qcow2_fast_exit(void)
+{
+	struct qcow2_fast_cpu *fc;
+	int cpu;
+
+	if (qcow2_fast_wq)
+		destroy_workqueue(qcow2_fast_wq);
+	qcow2_fast_wq = NULL;
+	if (!qcow2_fast)
+		return;
+	for_each_possible_cpu(cpu) {
+		fc = per_cpu_ptr(qcow2_fast, cpu);
+		WARN_ON_ONCE(!llist_empty(&fc->qios));
+	}
+	free_percpu(qcow2_fast);
+	qcow2_fast = NULL;
+}
+
+int qcow2_fast_init(void)
+{
+	struct qcow2_fast_cpu *fc;
+	int cpu;
+
+	qcow2_fast = alloc_percpu(struct qcow2_fast_cpu);
+	if (!qcow2_fast)
+		return -ENOMEM;
+	for_each_possible_cpu(cpu) {
+		fc = per_cpu_ptr(qcow2_fast, cpu);
+		init_llist_head(&fc->qios);
+		INIT_WORK(&fc->work, qcow2_fast_work);
+		atomic_set(&fc->busy, 0);
+	}
+
+	qcow2_fast_wq = alloc_workqueue("qcow2-fast",
+					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!qcow2_fast_wq) {
+		qcow2_fast_exit();
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 struct qio_data_llseek_hole {

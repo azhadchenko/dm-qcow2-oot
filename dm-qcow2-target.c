@@ -1184,16 +1184,26 @@ static int __init dm_qcow2_init(void)
 	if (!qrq_cache)
 		return -ENOMEM;
 
+	ret = qcow2_fast_init();
+	if (ret)
+		goto out_cache;
+
 	ret = dm_register_target(&qcow2_target);
 	if (ret)
-		kmem_cache_destroy(qrq_cache);
+		goto out_fast;
 
+	return 0;
+out_fast:
+	qcow2_fast_exit();
+out_cache:
+	kmem_cache_destroy(qrq_cache);
 	return ret;
 }
 
 static void __exit dm_qcow2_exit(void)
 {
 	dm_unregister_target(&qcow2_target);
+	qcow2_fast_exit();
 	kmem_cache_destroy(qrq_cache);
 }
 

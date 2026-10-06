@@ -4,6 +4,7 @@
 
 #include <linux/percpu-refcount.h>
 #include <linux/device-mapper.h>
+#include <linux/llist.h>
 #include <linux/fs.h>
 #include <linux/eventfd.h>
 
@@ -373,7 +374,7 @@ struct qio {
 	struct qcow2 *qcow2;
 	qcow2_endio_t endio_cb;
 	void *endio_cb_data;
-	struct work_struct worker;
+	struct llist_node fast_link; /* Link in qcow2_fast_cpu::qios */
 	int state;
 };
 
@@ -390,6 +391,8 @@ loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence);
 
 void do_qcow2_work(struct work_struct *ws);
 void do_qcow2_fsync_work(struct work_struct *ws);
+int qcow2_fast_init(void);
+void qcow2_fast_exit(void);
 int qcow2_alloc_and_insert_md_page(struct qcow2 *qcow2, u64 index,
 					struct md_page **md);
 struct md_page *qcow2_md_page_find_or_postpone(struct qcow2 *qcow2,
