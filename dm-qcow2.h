@@ -1,0 +1,473 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef __DM_QCOW2_H
+#define __DM_QCOW2_H
+
+#include <linux/percpu-refcount.h>
+#include <linux/device-mapper.h>
+#include <linux/fs.h>
+#include <linux/eventfd.h>
+
+#define DM_MSG_PREFIX "qcow2"
+
+#define QCOW_MAGIC (('Q' << 24) | ('F' << 16) | ('I' << 8) | 0xfb)
+/*
+ * QEMU has this limit, so we should follow it to keep our images
+ * mountable in VMs... Note, that it's possible to create a disk
+ * with parameters in QEMU, whose size can't be covered by refcount table.
+ */
+#define REFCOUNT_TABLE_MAX_SIZE (8 * 1024 * 1024)
+
+#define MIN_QIOS 512
+#define WB_TIMEOUT_JI (60 * HZ)
+#define ENOSPC_TIMEOUT_JI (20 * HZ)
+#define PREALLOC_SIZE (128ULL * 1024 * 1024)
+
+struct QCowHeader {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t backing_file_offset;
+	uint32_t backing_file_size;
+	uint32_t cluster_bits;
+	uint64_t size; /* in bytes */
+	uint32_t crypt_method;
+	uint32_t l1_size; /* number of entries in the active L1 table (not clusters) */
+	uint64_t l1_table_offset;
+	uint64_t refcount_table_offset;
+	uint32_t refcount_table_clusters;
+	uint32_t nb_snapshots;
+	uint64_t snapshots_offset;
+
+	/* The following fields are only valid for version >= 3 */
+#define INCOMPATIBLE_FEATURES_DIRTY_BIT		(1 << 0)
+#define INCOMPATIBLE_FEATURES_COMPRESSION	(1 << 3)
+#define INCOMPATIBLE_FEATURES_EXTL2_BIT		(1 << 4)
+	uint64_t incompatible_features;
+	uint64_t compatible_features;
+
+#define QCOW2_AUTOCLEAR_BITMAPS			(1 << 0)
+#define QCOW2_AUTOCLEAR_DATA_FILE_RAW		(1 << 1)
+	uint64_t autoclear_features;
+
+	uint32_t refcount_order;
+	uint32_t header_length;
+
+	/* Additional fields */
+#define QCOW2_COMPRESSION_TYPE_ZLIB 0
+#define QCOW2_COMPRESSION_TYPE_ZSTD 1
+	uint8_t compression_type;
+
+	/* header must be a multiple of 8 */
+	uint8_t padding[7];
+} __packed;
+
+#define  QCOW2_EXT_MAGIC_END 0
+#define  QCOW2_EXT_MAGIC_BITMAPS 0x23852875
+
+struct QCowExtension {
+	uint32_t magic;
+	uint32_t len;
+} __packed;
+
+/* Bitmap header extension constraints */
+#define QCOW2_MAX_BITMAPS 65535
+#define QCOW2_MAX_BITMAP_DIRECTORY_SIZE (1024 * QCOW2_MAX_BITMAPS)
+
+struct Qcow2BitmapHeaderExt {
+	uint32_t nb_bitmaps;
+	uint32_t reserved32;
+	uint64_t bitmap_directory_size;
+	uint64_t bitmap_directory_offset;
+} __packed;
+
+/* Bitmap directory entry flags */
+#define BME_RESERVED_FLAGS 0xfffffffcU
+#define BME_FLAG_IN_USE (1U << 0)
+#define BME_FLAG_AUTO   (1U << 1)
+
+struct Qcow2BitmapDirEntry {
+	/* header is 8 byte aligned */
+	uint64_t bitmap_table_offset;
+
+	uint32_t bitmap_table_size;
+	uint32_t flags;
+
+	uint8_t type;
+	uint8_t granularity_bits;
+	uint16_t name_size;
+	uint32_t extra_data_size;
+	/* extra data follows  */
+	/* name follows  */
+} __packed;
+
+struct wb_desc {
+	struct md_page *md;
+#define LX_INDEXES_PER_PAGE (PAGE_SIZE / sizeof(u64))
+#define LX_INDEXES_BYTES (BITS_TO_LONGS(LX_INDEXES_PER_PAGE) * sizeof(unsigned long))
+	unsigned long *changed_indexes;
+	/*
+	 * Contains old stable values of preallocated/cow entries
+	 * to restore them in case of md writeback fails.
+	 */
+	struct page *pe_page;
+	struct list_head completed_list;
+	/*
+	 * These bios want to be dispatched in case of writeback
+	 * success, or bio_endio() in case of error.
+	 * XXX: Possible we need the same for plain struct md_page.
+	 */
+	struct list_head dependent_list;
+	int nr_submitted;
+	bool completed;
+	u8 lx_level;
+	int ret;
+};
+
+struct lock_desc {
+	int nr; /* Number of set bits */
+	unsigned long indexes[LX_INDEXES_BYTES/sizeof(unsigned long)];
+};
+
+struct md_page {
+	struct rb_node node;
+	u64 id; /* Number of this page starting from hdr */
+#define MD_UPTODATE	(1U << 0) /* Page was read from disk */
+#define MD_DIRTY	(1U << 1) /* Page contains changes and wants writeback */
+#define MD_WRITEBACK	(1U << 2) /* Writeback was submitted */
+#define MD_WRITEBACK_ERROR (1U << 3) /* Last writeback failed with error */
+	unsigned int status;
+	struct page *page;
+	struct list_head wait_list;
+	/* To link in qcow2::{,slow}wb_batch_list and qcow2::QLIST_COMPLETED_WB */
+	struct list_head wb_link;
+	struct wb_desc *wbd; /* For L1 and L2 update */
+	struct lock_desc *lockd; /* Locked clus map */
+	/*
+	 * Readers of clusters, WRITE to which results in COW.
+	 * These are compressed clusters, snapshot clusters, etc.
+	 */
+	atomic_t wpc_readers;
+	int wpc_noread_count; /* Read is prohibited, if positive */
+	struct list_head wpc_readers_wait_list;
+};
+
+enum qcow2_backward_merge_state {
+	BACKWARD_MERGE_STOPPED,
+	BACKWARD_MERGE_START,
+	BACKWARD_MERGE_RUN,
+	BACKWARD_MERGE_WAIT_COMPLETION,
+	BACKWARD_MERGE_STOP,
+};
+
+enum qcow2_backward_merge_stage {
+	BACKWARD_MERGE_STAGE_NONE = 0,
+	BACKWARD_MERGE_STAGE_START,
+	BACKWARD_MERGE_STAGE_BREAK_L1COW,
+	BACKWARD_MERGE_STAGE_SET_DIRTY,
+	BACKWARD_MERGE_STAGE_RUNNING,
+	BACKWARD_MERGE_STAGE_WAITING_COMPLETION,
+	BACKWARD_MERGE_STAGE_COMPLETING,
+	BACKWARD_MERGE_STAGE_FAIL,
+	BACKWARD_MERGE_STAGE_MAX,
+};
+
+struct qcow2_backward_merge {
+	struct work_struct work;
+	struct qcow2 **pqcow2;
+	enum qcow2_backward_merge_state state;
+	int error;
+	struct eventfd_ctx *eventfd_ctx;
+	enum qcow2_backward_merge_stage stage;
+	long long progress;
+	long long max_progress;
+};
+
+struct qcow2_target {
+	struct dm_target *ti;
+#define QCOW2_QRQ_POOL_SIZE 512 /* Twice nr_requests from blk_mq_init_sched() */
+	mempool_t *qrq_pool;
+	mempool_t *qio_pool;
+	/*
+	 * start_processing_qrq() is the only place during IO handling,
+	 * where it's allowed to dereference @top. See backward merge.
+	 */
+	struct qcow2 *top;
+	struct workqueue_struct *wq;
+
+	struct completion inflight_ref_comp;
+	struct percpu_ref inflight_ref[2];
+	unsigned int inflight_ref_index:1;
+
+	bool service_operations_allowed;
+	bool wants_suspend;
+	bool md_writeback_error;
+	bool truncate_error;
+	bool event_enospc;
+
+	atomic_t service_qios;
+	struct wait_queue_head service_wq;
+
+	struct list_head enospc_qios; /* Delayed after ENOSPC */
+	struct timer_list enospc_timer;
+
+	struct work_struct event_work;
+	spinlock_t event_lock;
+	struct mutex ctl_mutex;
+
+	struct qcow2_backward_merge backward_merge;
+};
+
+enum {
+	QLIST_EMBEDDED = 0, /*
+			     * List for initial setup embedded qios
+			     * related to prq (in process context).
+			     * This is used only for top qcow2 image.
+			     */
+	QLIST_DEFERRED,
+	QLIST_FLUSH,
+	QLIST_COMPLETED_WB,
+	QLIST_ZREAD,
+	QLIST_BMERGE_WRITE,
+	QLIST_COW_DATA,
+	QLIST_INDEXES_WRITE,
+	QLIST_INDEXES_END,
+	QLIST_SEEK,
+
+	QLIST_COUNT,
+	QLIST_INVALID = QLIST_COUNT,
+};
+
+struct qcow2 {
+	struct qcow2_target *tgt;
+	struct file *file;
+	loff_t file_size;
+	loff_t file_preallocated_area_start;
+	/* Maximum file size covered by refcount table */
+	loff_t reftable_max_file_size;
+	/* Position to search next unused cluster */
+	loff_t free_cluster_search_pos;
+
+	u32 img_id;
+	struct qcow2 *lower; /* Lower delta (backing file) */
+
+	struct rb_root md_pages; /* Metadata pages */
+	struct QCowHeader hdr;
+	u32 clu_size;
+	u32 subclu_size;
+	u32 l2_entries;
+	u32 refblock_bits;
+	u32 refblock_entries;
+	bool ext_l2;
+
+	bool pause_submitting_qios; /* This is used only on top qcow2 image */
+	bool backward_merge_in_process;
+	/* File size covered by single page of block entries */
+	loff_t r2_page_covered_file_size;
+
+#define QCOW2_FAULT_RATIO 1000
+	u32 fault_injection; /* In 1%/QCOW2_FAULT_RATIO */
+
+	spinlock_t deferred_lock ____cacheline_aligned;
+	spinlock_t md_pages_lock;
+
+	struct list_head qios[QLIST_COUNT];
+	struct list_head resubmit_qios;
+	struct list_head paused_qios; /* For pause_submitting_qios */
+
+	/* For batching md update: */
+	struct list_head wb_batch_list;
+	struct list_head slow_wb_batch_list;
+	struct timer_list slow_wb_timer;
+
+	struct work_struct worker;
+	struct work_struct fsync_worker;
+};
+
+static inline const char *qcow2_device_name(struct dm_target *ti)
+{
+	return ti ? dm_disk(dm_table_get_md(ti->table))->disk_name : "-";
+}
+
+#define QCOW2_FMT(fmt) "dm-qcow2: %s: " fmt "\n"
+#define QC_ERR(dmti, fmt, ...)  pr_err (QCOW2_FMT(fmt),			\
+				        qcow2_device_name(dmti),	\
+				        ##__VA_ARGS__)
+#define QC_INFO(dmti, fmt, ...) pr_info(QCOW2_FMT(fmt),			\
+					qcow2_device_name(dmti),	\
+					##__VA_ARGS__)
+
+/*
+ * struct qio is embedded in every incoming bio, so we keep it
+ * as small as possible. It is aimed to fit enough bytes only
+ * for the most likely actions. To process COW, compressed
+ * clusters and other rare actions we need more auxiliary bytes,
+ * so we introduce this struct qio_ext in addition to struct qio.
+ */
+struct qio_ext {
+	struct md_page *lx_md, *r2_md, *md;
+	u32 lx_index_in_page, r2_index_in_page;
+	u64 allocated_clu_pos;
+
+	loff_t unuse_clu_pos;
+	loff_t unuse_clu_end;
+	u64 new_ext_l2;
+	u32 cow_mask;
+	bool only_set_ext_l2:1;
+	bool set_all_zeroes:1;
+
+	u8 lx_level;
+
+#define MD_INDEX_SET_UNLOCKED	(1ULL << 0)
+#define DEC_WPC_NOREAD_COUNT	(1ULL << 1)
+#define FREE_QIO_DATA_QVEC	(1ULL << 2)
+#define FREE_ALLOCATED_CLU	(1ULL << 3)
+	u8 cleanup_mask;
+	u16 zdata_off; /* Offset in first page: */
+	u16 cow_segs;
+};
+
+struct qcow2_rq {
+	struct request *rq;
+	struct bio_vec *bvec;
+};
+
+struct qio;
+typedef void (*qcow2_endio_t)(struct qcow2_target *, struct qio *,
+			      void *, blk_status_t);
+
+struct qio {
+	struct bvec_iter bi_iter;
+	struct bio_vec *bi_io_vec;
+	unsigned int bi_op;
+	blk_status_t bi_status;
+#define QIO_FREE_ON_ENDIO_FL	(1 << 0) /* Free this qio memory from qio_endio() */
+#define QIO_IS_MERGE_FL		(1 << 3) /* This is service merge qio */
+#define QIO_IS_DISCARD_FL	(1 << 4) /* This zeroes index (discard or backward merge) */
+#define QIO_IS_L1COW_FL		(1 << 5) /* This qio only wants COW at L1 */
+#define QIO_SPLIT_INHERITED_FLAGS (QIO_IS_DISCARD_FL)
+	u8 flags;
+#define REF_INDEX_INVALID 2
+	u8 ref_index:2;
+	/*
+	 * Some operations (say, COW) have more than one stage.
+	 * In case of a stage may delay bio (say, it may want
+	 * to wait reading md page from disk, or when some counter
+	 * becomes zero), this queue_list_id shows the place, where
+	 * bio processing should resume.
+	 */
+	u8 queue_list_id:4;
+
+	atomic_t remaining;
+
+	struct kiocb iocb;
+	atomic_t aio_ref;
+	int ret; /* iocb result */
+	void (*complete)(struct qio *me);
+	void *data;
+	/* Some operations (COW) require special destruction or requeue */
+	struct qio_ext *ext;
+	struct list_head link;
+	struct qcow2 *qcow2;
+	qcow2_endio_t endio_cb;
+	void *endio_cb_data;
+};
+
+#define CLU_OFF(qcow2, pos) (pos & (qcow2->clu_size - 1))
+#define SUBCLU_OFF(qcow2, pos) (pos & (qcow2->subclu_size - 1))
+
+void qcow2_destroy(struct qcow2 *qcow2);
+int qcow2_set_image_file_features(struct qcow2 *qcow2, bool dirty);
+int qcow2_message(struct dm_target *ti, unsigned int argc, char **argv,
+		  char *result, unsigned int maxlen);
+int qcow2_clone_and_map(struct dm_target *ti, struct request *rq,
+		   union map_info *info, struct request **clone);
+loff_t qcow2_llseek_hole(struct dm_target *ti, loff_t offset, int whence);
+
+void do_qcow2_work(struct work_struct *ws);
+void do_qcow2_fsync_work(struct work_struct *ws);
+int qcow2_alloc_and_insert_md_page(struct qcow2 *qcow2, u64 index,
+					struct md_page **md);
+struct md_page *qcow2_md_page_find_or_postpone(struct qcow2 *qcow2,
+					       u64 id, struct qio **qio);
+struct md_page *qcow2_md_page_renumber(struct qcow2 *qcow2, u64 id,
+				       u64 new_id);
+void qcow2_md_page_erase(struct qcow2 *qcow2, struct md_page *md);
+void qcow2_free_md_page(struct md_page *md);
+void qcow2_zero_fill_page_from(struct page *page, unsigned int from);
+int qcow2_rw_page_sync(unsigned int rw, struct qcow2 *qcow2, u64 index,
+			struct page *page);
+void qcow2_call_rw_iter(struct qcow2 *qcow2, loff_t pos, unsigned int rw,
+		  struct iov_iter *iter, struct qio *qio);
+void qcow2_calc_cached_parameters(struct qcow2 *qcow2, struct QCowHeader *hdr);
+void qcow2_slow_wb_timer_fn(struct timer_list *t);
+struct qio *qcow2_alloc_qio(mempool_t *pool, bool zero);
+void qcow2_init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2);
+void qcow2_dispatch_qios(struct qcow2 *qcow2, struct qio *qio,
+		   struct list_head *qio_list);
+void qcow2_submit_embedded_qios(struct qcow2_target *tgt, struct list_head *list);
+struct qcow2 *qcow2_ref_inc(struct qcow2_target *tgt, u8 *ref_index);
+void qcow2_ref_dec(struct qcow2_target *tgt, u8 ref_index);
+int qcow2_inflight_ref_switch(struct qcow2_target *tgt);
+void qcow2_flush_deferred_activity(struct qcow2_target *tgt, struct qcow2 *qcow2);
+int qcow2_truncate_safe(struct file *file, loff_t new_len);
+
+void qcow2_merge_backward_work(struct work_struct *work);
+void qcow2_merge_backward_cancel(struct qcow2_target *tgt);
+
+static inline struct qcow2_target *to_qcow2_target(struct dm_target *ti)
+{
+	return ti->private;
+}
+
+static inline struct qcow2 *top_qcow2_protected(struct dm_target *ti)
+{
+	struct qcow2_target *tgt = to_qcow2_target(ti);
+
+	return tgt->top;
+}
+
+static inline struct qio *qio_list_pop(struct list_head *qio_list)
+{
+	struct qio *qio;
+
+	qio = list_first_entry_or_null(qio_list, struct qio, link);
+	if (qio)
+		list_del_init(&qio->link);
+	return qio;
+}
+
+static inline bool fake_merge_qio(struct qio *qio)
+{
+	return (qio->bi_op == REQ_OP_WRITE &&
+		qio->bi_iter.bi_size == 0 &&
+		(qio->flags & QIO_IS_MERGE_FL));
+}
+
+static inline bool fake_l1cow_qio(struct qio *qio)
+{
+	return (qio->bi_op == REQ_OP_WRITE &&
+		qio->bi_iter.bi_size == 0 &&
+		(qio->flags & QIO_IS_L1COW_FL));
+}
+
+static inline bool fake_service_qio(struct qio *qio)
+{
+	return fake_merge_qio(qio) || fake_l1cow_qio(qio);
+}
+
+static inline bool qcow2_wants_check(struct qcow2_target *tgt)
+{
+
+	return !!(tgt->md_writeback_error|tgt->truncate_error);
+}
+
+static inline bool qcow2_file_is_writable(struct qcow2 *qcow2)
+{
+	return qcow2->file->f_mode & FMODE_WRITE;
+}
+
+static inline void remap_to_clu(struct qcow2 *qcow2, struct qio *qio, loff_t clu_pos)
+{
+	qio->bi_iter.bi_sector &= (to_sector(qcow2->clu_size) - 1);
+	qio->bi_iter.bi_sector |= (to_sector(clu_pos));
+}
+#endif
